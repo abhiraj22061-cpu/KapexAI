@@ -27,7 +27,8 @@ Use `uv add --package <pkg> <dep>` (never `pip install`). Example:
 
 - Framework: `pytest` with `pytest-asyncio` for async tests
 - Run backend tests: `cd backend && uv run pytest tests/ -v`
-- Test files: `backend/tests/test_*.py`
+- Run worker tests: `PYTHONPATH=. uv run --package worker pytest worker/tests/ -v` (worker tests hit real DB + Redis)
+- Test files: `backend/tests/test_*.py`, `worker/tests/test_*.py`
 
 ## Services
 
@@ -40,16 +41,19 @@ Use `uv add --package <pkg> <dep>` (never `pip install`). Example:
 - After editing `schema.prisma`, run `make generate` then `make migrate`
 - `.prisma/` is gitignored (generated Prisma client)
 
+Schema models: `User`, `Session`, `Message` (with `Role`, `Agent`, `Status` enums). The `Agent` enum tracks which agent produced a message (`QUESTIONNAIRE`, `RESEARCH`, `REPORT`, `GUARDRAIL`, `CHAT`, `TOOL`).
+
 ### `redis-service` — Redis Cloud (redis-py)
 
 - Provider: Redis Cloud via `redis-py` (standard TCP Redis, supports pub/sub)
 - Env var: `REDIS_URL` (e.g. `redis://user:pass@host:port`)
 - Shared client: `from redis_service import redis, connect_redis, disconnect_redis`
 - `connect_redis()` / `disconnect_redis()` are **async** (`await` them)
+- Client is created with `socket_timeout=None` — required so blocking commands like `brpop` (used by the worker) return `None` instead of racing with the 5s socket default and raising `TimeoutError`
 - Backend connects Redis in its `lifespan` alongside the DB
 - Supports pub/sub — used by the WebSocket endpoint for real-time streaming
 
-Full docs at `docs/services.md` and `docs/queue-and-streaming.md`.
+Full docs at `docs/agentic-pipeline.md` (router/tools/message log), `docs/services.md`, and `docs/queue-and-streaming.md`.
 
 ## OpenCode
 
@@ -59,14 +63,35 @@ Custom commands in `.opencode/commands/`:
 
 ## State of project
 
-Early stage — backend and worker have boilerplate main modules using `db_service`. Test runner (`pytest`) configured with async support.
+Functional end-to-end pipeline. Backend pushes jobs to a Redis queue; the worker consumes them and runs a LangGraph **chat + tools** graph; results stream back to the frontend over WebSocket + Redis pub/sub. The worker is functional, but the frontend is still a placeholder.
 
-## Boilerplate code
+## Architecture & data flow
+
+1. **Backend** (`backend/main.py`) exposes REST endpoints that create sessions/messages and push jobs to Redis queue `jobs:queue`.
+2. **Worker** (`worker/main.py`) polls `jobs:queue` with `brpop` (5s timeout), then runs the job through a compiled LangGraph graph.
+3. **Graph** (`worker/agent.py`) is a `StateGraph` with a single `router` node that decides how to handle each user message:
+   - `chat` — `chat_agent` (business-consultant persona) replies conversationally; the reply is saved as a `Message` and streamed.
+   - `tool` — dispatch to a registered tool (see `worker/tools/registry.py`). Each tool returns message entries with its own JSON shape (`type` + extra fields); `tool_node` persists and streams them.
+   - The **router** sends greetings/small talk to the chat agent (which stays strictly business-focused) and routes a shared business idea to the **questionnaire tool** to build context; while questions are pending, answers are routed back to it automatically.
+   - Every chat/tool turn ends by streaming a `suggestions` event listing available tools (name + example + suggestion phrase) and an `end` event.
+4. **Streaming** — each node publishes to pub/sub channel `stream:{session_id}`; the backend WebSocket endpoint `ws/session/{session_id}` forwards it to the client.
+5. **State** — a **message log** (`messages`) is cached in Redis (`langgraph_state:{session_id}`, 24h TTL) and rebuilt from DB message history (ordered by `created_at`) via `worker/helpers/persistence.py`. Each log entry is `{role, agent, type, content, ...tool-specific fields}`.
+
+## Key modules
 
 | File | Description |
 |---|---|
-| `backend/main.py` | FastAPI app with `/health` endpoint; connects DB and Redis on startup |
-| `backend/models/models.py` | Pydantic models (e.g. `WaitlistSignup`) |
-| `worker/main.py` | Async event loop worker; connects DB and handles graceful shutdown |
+| `backend/main.py` | FastAPI app: `/health`, `/waitlist`, `/create_chat_session`, `/push_chat_message`, `/get_sessions`, `ws/session/{session_id}` |
+| `backend/utils/db_utils.py` | Backend-side Prisma helpers (`get_user`, `get_session`, `get_all_sessions`) |
+| `worker/main.py` | Async worker loop; polls Redis queue and dispatches jobs |
+| `worker/agent.py` | LangGraph graph definition, state load/save, `process_job` |
+| `worker/agents/` | `router_agent.py` (intent classifier), `chat_agent.py` (consultant chat) |
+| `worker/helpers/persistence.py` | Prisma helpers + DB message-log rebuild for the worker |
+| `worker/helpers/messages.py` | Message-log helpers (transcript, questionnaire state, business context) |
+| `worker/helpers/events.py` | Pub/sub stream publishing helpers |
+| `worker/tools/` | Plug-and-play tools: `base.py`, `registry.py`, `questionnaire_tool.py`, `swot_tool.py`, `web_search_tool.py` |
+| `worker/prompts/` | LLM prompt templates per agent/tool |
+| `worker/tools/tavily_search.py` | Tavily search tool used by `web_search_tool` |
+| `worker/tests/` | `test_chat_tools.py` — queue/pub-sub, chat, tool, questionnaire, state-rebuild tests |
 
-Before running either, ensure the Prisma client is generated: `make generate`.
+Before running either service, ensure the Prisma client is generated: `make generate`.

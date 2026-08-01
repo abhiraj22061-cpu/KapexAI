@@ -1,6 +1,5 @@
-from prisma import Json
-
 from db_service import db
+from prisma import Json
 
 
 async def get_user_by_email(email: str):
@@ -43,6 +42,9 @@ async def mark_session_failed(session_id: str):
         where={"id": session_id}, data={"status": "FAILED"}
     )
 
+async def mark_session_active(session_id: str):
+    return await db.session.update(where={"id": session_id}, data={"status": "ACTIVE"})
+
 
 async def add_message(session_id: str, role: str, agent: str, content: dict):
     return await db.message.create(
@@ -60,45 +62,26 @@ def _empty_state(session_id: str, user_id: str) -> dict:
         "session_id": session_id,
         "user_id": user_id,
         "user_input": "",
-        "answers": {},
-        "questions": [],
-        "research_result": "",
-        "report": "",
-        "guardrail": {},
-        "phase": "QUESTIONNAIRE",
+        "messages": [],
+        "intent": "",
+        "tool": "",
     }
 
 
 async def build_state_from_db(session) -> dict:
-    """Rebuilds the langgraph state for a session from its chat history so the
-    workflow knows where to resume from. Order-insensitive: relies on message
-    content types, not created_at ordering (which can tie within a microsecond)."""
-    messages = await db.message.find_many(where={"sessionId": session.id})
+    """Rebuilds the message-log state for a session from its chat history,
+    ordered by creation time so the conversation is reconstructed in sequence."""
+    messages = await db.message.find_many(
+        where={"sessionId": session.id},
+        order={"created_at": "asc"},
+    )
 
     state = _empty_state(session.id, session.userId)
-    has_answers = False
-    has_report = False
-
+    log = []
     for msg in messages:
         content = msg.content
         if not isinstance(content, dict):
-            continue
-        if content.get("type") == "idea":
-            state["answers"]["business_about"] = content.get("content", "")
-            state["answers"].update(content.get("facts", {}))
-        elif content.get("type") == "answers":
-            state["answers"].update(content.get("answers", {}))
-            has_answers = True
-        elif content.get("type") == "report":
-            state["report"] = content.get("content", "")
-            has_report = True
-
-    if has_report:
-        state["phase"] = "COMPLETE"
-    elif has_answers:
-        state["phase"] = "RESEARCH"
-
-    if "business_about" not in state["answers"] and session.business_idea:
-        state["answers"]["business_about"] = session.business_idea
-
+            content = {}
+        log.append({"role": msg.role, "agent": msg.agent, **content})
+    state["messages"] = log
     return state

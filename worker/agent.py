@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 from typing import TypedDict
@@ -7,17 +8,22 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from redis_service import redis
 
-from worker.agents.guardrail_agent import GuardrailAgent
-from worker.agents.questionnaire_agent import QuestionnaireAgent
-from worker.agents.report_agent import ReportAgent
-from worker.agents.research_agent import ResearchAgent
+from worker.agents.chat_agent import ChatAgent
+from worker.agents.router_agent import RouterAgent
 from worker.helpers.events import publish_stream
+from worker.helpers.messages import (
+    append_message,
+    business_context,
+    format_transcript,
+    questionnaire_pending,
+)
 from worker.helpers.persistence import (
     add_message,
     build_state_from_db,
     get_session,
     mark_session_failed,
 )
+from worker.tools.registry import get_tool, list_tools
 
 logger = logging.getLogger(__name__)
 
@@ -29,83 +35,112 @@ class State(TypedDict):
     session_id: str
     user_id: str
     user_input: str
-    answers: dict[str, str]
-    questions: list[dict[str, str]]
-    research_result: str
-    report: str
-    guardrail: dict[str, str]
-    phase: str
+    messages: list[dict]
+    intent: str
+    tool: str
 
 
-questionnaire_agent = QuestionnaireAgent()
-research_agent = ResearchAgent()
-report_agent = ReportAgent()
-guardrail_agent = GuardrailAgent()
+router_agent = RouterAgent()
+chat_agent = ChatAgent()
 
 
-async def orchestrator(state: State) -> dict:
-    """Consumes the current user message during the questionnaire phase and
-    returns only the fields it changed; the conditional edge then routes to the
-    right agent (or END) based on the updated phase."""
-    if state["phase"] != "QUESTIONNAIRE":
-        return {}
-    if not state.get("questions"):
-        return await questionnaire_agent.start(state)
-    return await questionnaire_agent.collect_answers(state)
-
-
-async def research_node(state: State) -> dict:
-    result = await asyncio.to_thread(research_agent.run, state["answers"])
-    await publish_stream(state["session_id"], {"type": "research", "content": result})
-    return {"research_result": result, "phase": "REPORT"}
-
-
-async def report_node(state: State) -> dict:
-    result = await asyncio.to_thread(report_agent.run, state["research_result"])
-    await publish_stream(state["session_id"], {"type": "report", "content": result})
-    return {"report": result, "phase": "GUARDRAIL"}
-
-
-async def guardrail_node(state: State) -> dict:
-    result = await asyncio.to_thread(guardrail_agent.run, state["report"])
-    await add_message(
-        state["session_id"],
-        "ASSISTANT",
-        "REPORT",
-        {"type": "report", "content": state["report"]},
+async def router_node(state: State) -> dict:
+    """Routes the user's message to a chat reply or a specific tool. On a fresh
+    session the LLM decides whether to greet (chat) or kick off the
+    questionnaire; while a questionnaire is pending, answers are routed back to
+    it automatically."""
+    if questionnaire_pending(state["messages"]):
+        return {"intent": "tool", "tool": "questionnaire"}
+    decision = await router_agent.classify(
+        state["user_input"], state["messages"], list_tools()
     )
-    await publish_stream(state["session_id"], {"type": "guardrail", "content": result})
-    await publish_stream(state["session_id"], {"type": "end"})
-    return {"guardrail": result, "phase": "COMPLETE"}
+    if decision.get("intent") == "tool" and get_tool(decision.get("tool", "")):
+        return {"intent": "tool", "tool": decision["tool"]}
+    return {"intent": "chat"}
+
+
+async def chat_node(state: State) -> dict:
+    session_id = state["session_id"]
+    user_input = state["user_input"]
+    context = business_context(state["messages"])
+    transcript = format_transcript(state["messages"])
+
+    reply = await chat_agent.run(user_input, transcript, context, list_tools())
+
+    user_entry = {"role": "USER", "agent": "CHAT", "type": "chat", "content": user_input}
+    assistant_entry = {
+        "role": "ASSISTANT",
+        "agent": "CHAT",
+        "type": "chat",
+        "content": reply,
+    }
+
+    messages = append_message(state["messages"], user_entry)
+    messages = append_message(messages, assistant_entry)
+
+    await add_message(session_id, "USER", "CHAT", {"type": "chat", "content": user_input})
+    await add_message(
+        session_id, "ASSISTANT", "CHAT", {"type": "chat", "content": reply}
+    )
+
+    await publish_stream(session_id, {"type": "chat", "content": reply})
+    await publish_suggestions(session_id)
+    await publish_stream(session_id, {"type": "end"})
+    return {"messages": messages}
+
+
+async def tool_node(state: State) -> dict:
+    session_id = state["session_id"]
+    tool = get_tool(state.get("tool", ""))
+    
+    if tool is None:
+        return await chat_node(state)
+
+    if inspect.iscoroutinefunction(tool.run):
+        entries = await tool.run(state)
+    else:
+        entries = await asyncio.to_thread(tool.run, state)
+
+    messages = list(state["messages"])
+    for entry in entries or []:
+        content = {k: v for k, v in entry.items() if k not in ("role", "agent")}
+        messages = append_message(messages, entry)
+        await add_message(session_id, entry["role"], entry["agent"], content)
+        if entry.get("role") == "ASSISTANT":
+            await publish_stream(session_id, content)
+
+    await publish_suggestions(session_id)
+    await publish_stream(session_id, {"type": "end"})
+    return {"messages": messages}
+
+
+async def publish_suggestions(session_id: str) -> None:
+    await publish_stream(session_id, {"type": "suggestions", "tools": list_tools()})
 
 
 def route(state: State) -> str:
-    phase = state["phase"]
-    if phase == "RESEARCH":
-        return "research"
-    if phase == "REPORT":
-        return "report"
-    if phase == "GUARDRAIL":
-        return "guardrail"
+    if state.get("intent") == "chat":
+        return "chat"
+    if state.get("intent") == "tool":
+        return "tool"
     return END
 
 
 def build_graph() -> CompiledStateGraph:
     graph = StateGraph(State)
-    graph.add_node("orchestrator", orchestrator)
-    graph.add_node("research", research_node)
-    graph.add_node("report", report_node)
-    graph.add_node("guardrail", guardrail_node)
 
-    graph.add_edge(START, "orchestrator")
+    graph.add_node("router", router_node)
+    graph.add_node("chat", chat_node)
+    graph.add_node("tool", tool_node)
+
+    graph.add_edge(START, "router")
     graph.add_conditional_edges(
-        "orchestrator",
+        "router",
         route,
-        {"research": "research", "report": "report", "guardrail": "guardrail", END: END},
+        {"chat": "chat", "tool": "tool", END: END},
     )
-    graph.add_edge("research", "report")
-    graph.add_edge("report", "guardrail")
-    graph.add_edge("guardrail", END)
+    graph.add_edge("chat", END)
+    graph.add_edge("tool", END)
 
     return graph.compile()
 
@@ -114,12 +149,14 @@ async def load_state(session_id: str) -> State:
     raw = await redis.get(STATE_KEY.format(session_id=session_id))
     if raw:
         state = json.loads(raw)
-    else:
-        session = await get_session(session_id)
-        if session is None:
-            raise ValueError(f"Session not found: {session_id}")
-        state = await build_state_from_db(session)
-    return state
+        state.setdefault("messages", [])
+        state.setdefault("intent", "")
+        state.setdefault("tool", "")
+        return state
+    session = await get_session(session_id)
+    if session is None:
+        raise ValueError(f"Session not found: {session_id}")
+    return await build_state_from_db(session)
 
 
 async def save_state(session_id: str, state: State) -> None:
@@ -134,6 +171,7 @@ async def process_job(job: dict, graph: CompiledStateGraph) -> State:
     session_id = job["session_id"]
     job_id = str(job.get("job_id", "") or "")
     user_input = str(job.get("user_input", "") or "")
+    
     try:
         state = await load_state(session_id)
         state["user_input"] = user_input
