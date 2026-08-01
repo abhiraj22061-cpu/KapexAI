@@ -24,8 +24,10 @@ async def main():
     await disconnect_db()
     print("Worker shut down gracefully")
 '''
+import asyncio
+
 from worker.agent import run_cli
 
 if __name__ == "__main__":
     #asyncio.run(main())
-    run_cli()
+    asyncio.run(run_cli())

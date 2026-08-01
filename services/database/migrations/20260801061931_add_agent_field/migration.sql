@@ -1,0 +1,5 @@
+-- CreateEnum
+CREATE TYPE "Agent" AS ENUM ('QUESTIONNAIRE', 'RESEARCH', 'REPORT', 'GUARDRAIL');
+
+-- AlterTable
+ALTER TABLE "Message" ADD COLUMN     "agent" "Agent" NOT NULL DEFAULT 'QUESTIONNAIRE';

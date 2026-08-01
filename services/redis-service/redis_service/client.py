@@ -16,3 +16,15 @@ async def connect_redis():
 async def disconnect_redis():
     await redis.aclose()
     print("Disconnected from Redis")
+
+
+async def push_message(queue: str, message: str) -> None:
+    await redis.rpush(queue, message)
+
+
+async def pop_message(queue: str) -> str | None:
+    return await redis.lpop(queue)
+
+
+async def publish(channel: str, message: str) -> None:
+    await redis.publish(channel, message)

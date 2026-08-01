@@ -41,6 +41,8 @@ model Message {
 
   role Role
 
+  agent Agent @default(QUESTIONNAIRE)
+
   content Json
 
   created_at DateTime @default(now())
@@ -51,6 +53,13 @@ model Message {
 enum Role {
   USER
   ASSISTANT
+}
+
+enum Agent {
+  QUESTIONNAIRE
+  RESEARCH
+  REPORT
+  GUARDRAIL
 }
 
 enum Status {
