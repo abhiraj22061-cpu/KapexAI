@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -166,6 +167,7 @@ class TestCreateChatSession:
         with (
             patch("backend.main.get_user", new_callable=AsyncMock, return_value=Mock(id="user-123", email="test@test.com")),
             patch("backend.main.db") as mock_db,
+            patch("backend.main.uuid4", return_value="job-456"),
             patch("backend.main.redis.lpush", new_callable=AsyncMock) as mock_lpush,
         ):
             mock_db.session.create = AsyncMock(return_value=Mock(id=session_id))
@@ -173,15 +175,18 @@ class TestCreateChatSession:
             async with client as c:
                 response = await c.post(
                     "/create_chat_session",
-                    json={"email": "test@test.com", "business_idea": "AI SaaS"},
+                    json={"email": "test@test.com", "content": "AI SaaS"},
                 )
 
         assert response.status_code == 201
         data = response.json()
         assert data["session_id"] == session_id
+        assert data["job_id"] == "job-456"
         mock_lpush.assert_called_once_with(
             "jobs:queue",
-            json.dumps({"session_id": session_id, "user_input": "AI SaaS"}),
+            json.dumps(
+                {"job_id": "job-456", "session_id": session_id, "user_input": "AI SaaS"}
+            ),
         )
 
     @pytest.mark.asyncio
@@ -190,14 +195,14 @@ class TestCreateChatSession:
             async with client as c:
                 response = await c.post(
                     "/create_chat_session",
-                    json={"email": "unknown@test.com", "business_idea": "AI SaaS"},
+                    json={"email": "unknown@test.com", "content": "AI SaaS"},
                 )
 
         assert response.status_code == 404
         assert response.json() == {"message": "user not found with given email"}
 
     @pytest.mark.asyncio
-    async def test_returns_422_for_missing_business_idea(self, client):
+    async def test_returns_422_for_missing_content(self, client):
         async with client as c:
             response = await c.post("/create_chat_session", json={"email": "test@test.com"})
         assert response.status_code == 422
@@ -207,7 +212,7 @@ class TestCreateChatSession:
         async with client as c:
             response = await c.post(
                 "/create_chat_session",
-                json={"email": "not-an-email", "business_idea": "AI SaaS"},
+                json={"email": "not-an-email", "content": "AI SaaS"},
             )
         assert response.status_code == 422
 
@@ -216,9 +221,133 @@ class TestCreateChatSession:
         async with client as c:
             response = await c.post(
                 "/create_chat_session",
-                json={"email": "", "business_idea": "AI SaaS"},
+                json={"email": "", "content": "AI SaaS"},
             )
         assert response.status_code == 422
+
+
+# ── Push Chat Message ────────────────────────────────────────────────────────
+
+class TestPushChatMessage:
+    @pytest.mark.asyncio
+    async def test_pushes_message_to_queue(self, client):
+        session_id = "session-789"
+        user = Mock(id="user-123", email="test@test.com")
+
+        with (
+            patch("backend.main.get_user", new_callable=AsyncMock, return_value=user),
+            patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id=session_id, userId="user-123")),
+            patch("backend.main.uuid4", return_value="job-789"),
+            patch("backend.main.redis.lpush", new_callable=AsyncMock) as mock_lpush,
+        ):
+            async with client as c:
+                response = await c.post(
+                    "/push_chat_message",
+                    json={"session_id": session_id, "email": "test@test.com", "content": "My answers here"},
+                )
+
+        assert response.status_code == 201
+        assert response.json()["session_id"] == session_id
+        assert response.json()["job_id"] == "job-789"
+        mock_lpush.assert_called_once_with(
+            "jobs:queue",
+            json.dumps(
+                {"job_id": "job-789", "session_id": session_id, "user_input": "My answers here"}
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_user_not_found(self, client):
+        with patch("backend.main.get_user", new_callable=AsyncMock, return_value=None):
+            async with client as c:
+                response = await c.post(
+                    "/push_chat_message",
+                    json={"session_id": "s1", "email": "unknown@test.com", "content": "hi"},
+                )
+
+        assert response.status_code == 404
+        assert response.json() == {"message": "user not found with given email"}
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_not_found(self, client):
+        with (
+            patch("backend.main.get_user", new_callable=AsyncMock, return_value=Mock(id="user-123", email="test@test.com")),
+            patch("backend.main.get_session", new_callable=AsyncMock, return_value=None),
+        ):
+            async with client as c:
+                response = await c.post(
+                    "/push_chat_message",
+                    json={"session_id": "missing", "email": "test@test.com", "content": "hi"},
+                )
+
+        assert response.status_code == 404
+        assert response.json() == {"message": "session not found for user with given email"}
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        with (
+            patch("backend.main.get_user", new_callable=AsyncMock, return_value=Mock(id="user-123", email="test@test.com")),
+            patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+        ):
+            async with client as c:
+                response = await c.post(
+                    "/push_chat_message",
+                    json={"session_id": "s1", "email": "test@test.com", "content": "hi"},
+                )
+
+        assert response.status_code == 404
+        assert response.json() == {"message": "session not found for user with given email"}
+
+    @pytest.mark.asyncio
+    async def test_returns_422_for_missing_content(self, client):
+        async with client as c:
+            response = await c.post(
+                "/push_chat_message",
+                json={"session_id": "s1", "email": "test@test.com"},
+            )
+        assert response.status_code == 422
+
+
+# ── Get Sessions ─────────────────────────────────────────────────────────────
+
+class TestGetSessions:
+    @pytest.mark.asyncio
+    async def test_returns_serialized_sessions(self, client):
+        user = Mock(id="user-123", email="test@test.com")
+        session_mock = Mock(
+            id="s1",
+            business_idea="AI SaaS",
+            status="ACTIVE",
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        with (
+            patch("backend.main.get_user", new_callable=AsyncMock, return_value=user),
+            patch("backend.main.get_all_sessions", new_callable=AsyncMock, return_value=[session_mock]),
+        ):
+            async with client as c:
+                response = await c.get("/get_sessions", params={"email": "test@test.com"})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "data": [
+                {
+                    "id": "s1",
+                    "business_idea": "AI SaaS",
+                    "status": "ACTIVE",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_user_not_found(self, client):
+        with patch("backend.main.get_user", new_callable=AsyncMock, return_value=None):
+            async with client as c:
+                response = await c.get("/get_sessions", params={"email": "unknown@test.com"})
+
+        assert response.status_code == 404
+        assert response.json() == {"message": "user not found with given email"}
 
 
 # ── WebSocket Stream ─────────────────────────────────────────────────────────

@@ -1,6 +1,12 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from fastapi import FastAPI, status, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,8 +15,8 @@ from fastapi.responses import JSONResponse
 from db_service import connect_db, disconnect_db, db
 from redis_service import connect_redis, disconnect_redis, redis
 
-from .models.models import WaitlistSignup, CreateChatSession
-from .utils.db_utils import get_user
+from .models.models import WaitlistSignup, CreateChatSession, UserChatMessage
+from .utils.db_utils import get_user, get_session, get_all_sessions
 
 
 @asynccontextmanager
@@ -61,17 +67,65 @@ async def create_chat_session(user_data: CreateChatSession):
     session = await db.session.create(
         data={
             "userId": user.id,
-            "business_idea": user_data.business_idea,
+            "business_idea": user_data.content,
         }
     )
 
-    job = {"session_id": session.id, "user_input": user_data.business_idea}
+    job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": user_data.content}
     await redis.lpush("jobs:queue", json.dumps(job))
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
-        content={"message": "success", "session_id": session.id},
+        content={"message": "success", "session_id": session.id, "job_id": job["job_id"]},
     )
+
+
+@app.post("/push_chat_message")
+async def push_chat_message(user_data: UserChatMessage):
+    """Pushes chat message to the queue, given the session id"""
+    user = await get_user(user_data.email)
+    if not user:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "user not found with given email"},
+        )
+
+    session = await get_session(user_data.session_id)
+    if not session or session.userId != user.id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "session not found for user with given email"},
+        )
+
+    job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": user_data.content}
+    await redis.lpush("jobs:queue", json.dumps(job))
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={"message": "success", "session_id": session.id, "job_id": job["job_id"]},
+    )
+
+@app.get("/get_sessions")
+async def get_sessions(email: str):
+    user = await get_user(email)
+    if not user:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "user not found with given email"},
+        )
+
+    sessions = await get_all_sessions(user)
+    data = [
+        {
+            "id": s.id,
+            "business_idea": s.business_idea,
+            "status": str(s.status),
+            "created_at": s.created_at.isoformat(),
+        }
+        for s in sessions
+    ]
+
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"data": data})
 
 
 @app.websocket("/ws/session/{session_id}")

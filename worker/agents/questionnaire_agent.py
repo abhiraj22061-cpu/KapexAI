@@ -1,104 +1,121 @@
 import json
 from pathlib import Path
-from uuid import uuid4
 
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-from redis_service import push_message
+from langchain_mistralai import ChatMistralAI
 
-from worker.helpers.events import publish_event
-from worker.helpers.persistence import (
-    add_message,
-    create_session,
-    create_user,
-    get_resume_state,
-    get_user_by_email,
-    update_session_business_idea,
-    update_user_name,
+from worker.helpers.events import publish_stream
+from worker.helpers.persistence import add_message, update_session_business_idea
+from worker.prompts.questionnaire import (
+    MAX_QUESTIONS,
+    PARSE_ANSWERS_TEMPLATE,
+    PLAN_QUESTIONNAIRE_TEMPLATE,
 )
-from worker.prompts.questionnaire import QUESTIONS
 
-NAME_PROMPT = "What is your name?"
-USER_QUEUE = "user_messages"
+FACTS_KEYS = ("business_location", "business_vision", "target_customers")
+
+
+def _as_text(value) -> str:
+    if isinstance(value, (tuple, list)):
+        value = value[-1] if value else ""
+    return str(value or "").strip()
 
 
 class QuestionnaireAgent:
     def __init__(self) -> None:
-        self.session_id: str | None = None
-        self.user_id: str | None = None
-        self.email: str = ""
-        self.answers: dict[str, str] = {}
+        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0)
 
-    async def ask(self) -> dict[str, str]:
-        email = self._prompt("What is your email?")
-        self.email = email
+    async def start(self, state: dict) -> dict:
+        """Consumes the initial business idea, extracts known facts and asks the
+        user up to MAX_QUESTIONS deep questions all at once."""
+        session_id = state["session_id"]
+        idea = _as_text(state["user_input"])
 
-        user = await get_user_by_email(email)
-        if user is None:
-            user = await create_user(email)
-            self.user_id = user.id
-        else:
-            self.user_id = user.id
-            if user.name:
-                self.answers["user_name"] = user.name
+        plan = await self._plan(idea)
+        facts = plan.get("facts", {}) or {}
+        questions = plan.get("questions", [])[:MAX_QUESTIONS]
 
-        resume = await get_resume_state(self.user_id)
-        self.session_id = resume["session_id"]
-        for key, value in resume["answers"].items():
-            self.answers.setdefault(key, value)
+        answers = {"business_about": idea}
+        for key in FACTS_KEYS:
+            value = (facts.get(key) or "").strip()
+            if value:
+                answers[key] = value
 
-        if self.session_id is None:
-            session = await create_session(self.user_id)
-            self.session_id = session.id
+        await add_message(
+            session_id,
+            "USER",
+            "QUESTIONNAIRE",
+            {
+                "type": "idea",
+                "content": idea,
+                "facts": {k: answers[k] for k in FACTS_KEYS if k in answers},
+            },
+        )
+        await update_session_business_idea(session_id, idea)
 
-        await publish_event("session_started", self.session_id, email=self.email)
+        await publish_stream(
+            session_id,
+            {
+                "type": "questionnaire",
+                "content": "Tell me a bit more so I can build the best report. Please answer the following:",
+                "questions": questions,
+            },
+        )
 
-        prompts = [("user_name", NAME_PROMPT)] + QUESTIONS
-        for key, question in prompts:
-            if key in self.answers:
-                print(f"\nQ: {question}\nA: {self.answers[key]} (from previous session)")
-                continue
+        return {"answers": answers, "questions": questions, "phase": "QUESTIONNAIRE"}
 
-            print(f"\nQ: {question}")
-            answer = self._prompt("A")
-            self.answers[key] = answer
+    async def collect_answers(self, state: dict) -> dict:
+        """Consumes the user's answers to all questions in one message."""
+        session_id = state["session_id"]
+        questions = state.get("questions", [])
+        answers_text = _as_text(state["user_input"])
 
-            await add_message(
-                self.session_id,
-                role="USER",
-                agent="QUESTIONNAIRE",
-                content={"type": "answer", "key": key, "content": answer},
-            )
-            if key == "user_name":
-                await update_user_name(self.user_id, answer)
+        parsed_answers = await self._parse(questions, answers_text)
+        answers = dict(state.get("answers", {}))
+        for question, answer in zip(questions, parsed_answers):
+            key = question.get("key", "")
+            if key:
+                answers[key] = answer
 
-            await push_message(
-                USER_QUEUE,
-                json.dumps(
-                    {
-                        "session_id": self.session_id,
-                        "key": key,
-                        "content": answer,
-                        "agent": "QUESTIONNAIRE",
-                    }
-                ),
-            )
-            await publish_event("answer_received", self.session_id, key=key, content=answer)
+        await add_message(
+            session_id,
+            "USER",
+            "QUESTIONNAIRE",
+            {"type": "answers", "answers": answers, "content": answers_text},
+        )
+        await publish_stream(
+            session_id,
+            {
+                "type": "questionnaire_complete",
+                "content": "Got it. Running research now, this can take a minute...",
+            },
+        )
 
-        await publish_event("questionnaire_complete", self.session_id, answers=self.answers)
+        return {"answers": answers, "phase": "RESEARCH"}
 
-        if "business_about" in self.answers:
-            await update_session_business_idea(self.session_id, self.answers["business_about"])
+    async def _plan(self, idea: str) -> dict:
+        chain = PLAN_QUESTIONNAIRE_TEMPLATE | self.llm
+        response = await chain.ainvoke({"idea": idea, "max_questions": MAX_QUESTIONS})
+        plan = parse_json(response.content)
+        if not isinstance(plan, dict) or "questions" not in plan:
+            raise ValueError(f"Unexpected questionnaire plan: {response.content}")
+        return plan
 
-        return self.answers
+    async def _parse(self, questions: list[dict], answers_text: str) -> list[str]:
+        chain = PARSE_ANSWERS_TEMPLATE | self.llm
+        response = await chain.ainvoke(
+            {"questions": json.dumps(questions), "answers": answers_text}
+        )
+        data = parse_json(response.content)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected a JSON list of answers: {response.content}")
+        return [str(a) for a in data]
 
-    @staticmethod
-    def _prompt(label: str) -> str:
-        answer = input(f"{label}: ").strip()
-        if answer.lower() in ("quit", "exit", "q"):
-            raise SystemExit("Exited.")
-        while not answer:
-            print("Please provide an answer.")
-            answer = input(f"{label}: ").strip()
-        return answer
+
+def parse_json(raw: str):
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return json.loads(text)

@@ -7,4 +7,9 @@ class WaitlistSignup(BaseModel):
 
 class CreateChatSession(BaseModel):
     email: EmailStr
-    business_idea: str
+    content: str
+
+class UserChatMessage(BaseModel):
+    session_id: str
+    email: EmailStr
+    content: str
