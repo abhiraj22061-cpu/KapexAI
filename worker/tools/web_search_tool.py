@@ -7,7 +7,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 from langchain_mistralai import ChatMistralAI
 from langgraph.prebuilt import create_react_agent
 
-from prompts.research_websearch import RESEARCH_WEBSEARCH_PROMPT
+from worker.prompts.research_websearch import RESEARCH_WEBSEARCH_PROMPT
 from worker.tools.base import Tool
 from worker.tools.tavily_search import tavily_search
 

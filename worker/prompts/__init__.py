@@ -6,7 +6,7 @@ from worker.prompts.questionnaire import (
     PLAN_QUESTIONNAIRE_PROMPT,
     PLAN_QUESTIONNAIRE_TEMPLATE,
 )
-from prompts.research_websearch import RESEARCH_WEBSEARCH_PROMPT
+from worker.prompts.research_websearch import RESEARCH_WEBSEARCH_PROMPT
 from worker.prompts.router import ROUTER_PROMPT, ROUTER_TEMPLATE
 from worker.prompts.swot import SWOT_PROMPT, SWOT_TEMPLATE
 
