@@ -63,7 +63,7 @@ Custom commands in `.opencode/commands/`:
 
 ## State of project
 
-Functional end-to-end pipeline. Backend pushes jobs to a Redis queue; the worker consumes them and runs a LangGraph **chat + tools** graph; results stream back to the frontend over WebSocket + Redis pub/sub. The worker is functional, but the frontend is still a placeholder.
+Functional end-to-end pipeline with Google OAuth authentication. Backend pushes jobs to a Redis queue; the worker consumes them and runs a LangGraph **chat + tools** graph; results stream back to the frontend over WebSocket + Redis pub/sub. Auth endpoints (`/auth/google`, `/auth/google/callback`, `/auth/me`) are protected by JWT tokens. The frontend is still a placeholder.
 
 ## Architecture & data flow
 
@@ -82,6 +82,9 @@ Functional end-to-end pipeline. Backend pushes jobs to a Redis queue; the worker
 | File | Description |
 |---|---|
 | `backend/main.py` | FastAPI app: `/health`, `/waitlist`, `/create_chat_session`, `/push_chat_message`, `/get_sessions`, `ws/session/{session_id}` |
+| `backend/utils/jwt_utils.py` | JWT token creation and verification using python-jose (HS256, 7-day expiry) |
+| `backend/middleware/auth.py` | FastAPI `get_current_user` dependency — extracts Bearer token, decodes JWT, fetches user from DB |
+| `backend/routers/auth.py` | Google OAuth endpoints: `/auth/google`, `/auth/google/callback`, `/auth/me` |
 | `backend/utils/db_utils.py` | Backend-side Prisma helpers (`get_user`, `get_session`, `get_all_sessions`) |
 | `worker/main.py` | Async worker loop; polls Redis queue and dispatches jobs |
 | `worker/agent.py` | LangGraph graph definition, state load/save, `process_job` |
@@ -93,5 +96,6 @@ Functional end-to-end pipeline. Backend pushes jobs to a Redis queue; the worker
 | `worker/prompts/` | LLM prompt templates per agent/tool |
 | `worker/tools/tavily_search.py` | Tavily search tool used by `web_search_tool` |
 | `worker/tests/` | `test_chat_tools.py` — queue/pub-sub, chat, tool, questionnaire, state-rebuild tests |
+| `backend/tests/` | `test_main.py`, `test_jwt_utils.py`, `test_auth.py`, `test_middleware.py` |
 
 Before running either service, ensure the Prisma client is generated: `make generate`.

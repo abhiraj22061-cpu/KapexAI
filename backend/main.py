@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-from fastapi import FastAPI, status, WebSocket
+from fastapi import FastAPI, status, WebSocket, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -16,7 +16,9 @@ from db_service import connect_db, disconnect_db, db
 from redis_service import connect_redis, disconnect_redis, redis
 
 from .models.models import WaitlistSignup, CreateChatSession, UserChatMessage
-from .utils.db_utils import get_user, get_session, get_all_sessions
+from .utils.db_utils import get_session, get_all_sessions
+from .routers import auth
+from .middleware.auth import get_current_user
 
 
 @asynccontextmanager
@@ -39,6 +41,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
+
 
 @app.get("/health")
 async def health():
@@ -54,19 +58,11 @@ async def join_waitlist(signup: WaitlistSignup):
 
 
 @app.post("/create_chat_session")
-async def create_chat_session(user_data: CreateChatSession):
+async def create_chat_session(user_data: CreateChatSession, current_user = Depends(get_current_user)):
     """Creates new chat session and pushes job to redis"""
-    user = await get_user(user_data.email)
-
-    if not user:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"message": "user not found with given email"},
-        )
-
     session = await db.session.create(
         data={
-            "userId": user.id,
+            "userId": current_user.id,
             "business_idea": user_data.content,
         }
     )
@@ -81,20 +77,13 @@ async def create_chat_session(user_data: CreateChatSession):
 
 
 @app.post("/push_chat_message")
-async def push_chat_message(user_data: UserChatMessage):
+async def push_chat_message(user_data: UserChatMessage, current_user = Depends(get_current_user)):
     """Pushes chat message to the queue, given the session id"""
-    user = await get_user(user_data.email)
-    if not user:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"message": "user not found with given email"},
-        )
-
     session = await get_session(user_data.session_id)
-    if not session or session.userId != user.id:
+    if not session or session.userId != current_user.id:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
-            content={"message": "session not found for user with given email"},
+            content={"message": "session not found for user"},
         )
 
     job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": user_data.content}
@@ -106,15 +95,8 @@ async def push_chat_message(user_data: UserChatMessage):
     )
 
 @app.get("/get_sessions")
-async def get_sessions(email: str):
-    user = await get_user(email)
-    if not user:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"message": "user not found with given email"},
-        )
-
-    sessions = await get_all_sessions(user)
+async def get_sessions(current_user = Depends(get_current_user)):
+    sessions = await get_all_sessions(current_user)
     data = [
         {
             "id": s.id,
