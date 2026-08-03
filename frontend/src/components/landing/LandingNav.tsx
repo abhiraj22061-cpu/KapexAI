@@ -11,7 +11,6 @@ export function LandingNav() {
       <div className="nav-links">
         <a href="#home">Home</a>
         <a href="#features">Features</a>
-        <a href="#waitlist">Waitlist</a>
       </div>
       <div className="nav-auth">
         {user ? (

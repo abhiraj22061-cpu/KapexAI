@@ -2,7 +2,6 @@ import { useNavigate } from 'react-router-dom'
 import { GoogleSignInButton } from '../components/auth/GoogleSignInButton'
 import { Features } from '../components/landing/Features'
 import { LandingNav } from '../components/landing/LandingNav'
-import { WaitlistSection } from '../components/landing/WaitlistSection'
 import { useAuth } from '../lib/auth'
 
 export function LandingPage() {
@@ -45,7 +44,6 @@ export function LandingPage() {
       </section>
 
       <Features />
-      <WaitlistSection />
 
       <footer className="footer">
         <span className="footer-mark" aria-hidden="true" />
