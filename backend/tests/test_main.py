@@ -476,6 +476,396 @@ class TestGetSessions:
         assert response.status_code == 401
 
 
+# ── Get Messages ─────────────────────────────────────────────
+
+class TestGetMessages:
+    @pytest.mark.asyncio
+    async def test_returns_messages_for_session(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        message_mocks = [
+            Mock(
+                id="m1",
+                role="USER",
+                agent="CHAT",
+                content={"type": "chat", "content": "hi"},
+                created_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+            ),
+            Mock(
+                id="m2",
+                role="ASSISTANT",
+                agent="TOOL",
+                content={"type": "swot", "content": "done", "sections": {}},
+                created_at=datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),
+            ),
+        ]
+        mock_db = MagicMock()
+        mock_db.message.find_many = AsyncMock(return_value=message_mocks)
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="user-123")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_messages?session_id=s1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 200
+            assert response.json()["data"] == [
+                {
+                    "id": "m1",
+                    "role": "USER",
+                    "agent": "CHAT",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "type": "chat",
+                    "content": "hi",
+                },
+                {
+                    "id": "m2",
+                    "role": "ASSISTANT",
+                    "agent": "TOOL",
+                    "created_at": "2026-01-01T00:01:00+00:00",
+                    "type": "swot",
+                    "content": "done",
+                    "sections": {},
+                },
+            ]
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_not_found(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=None),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_messages?session_id=missing",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_messages?session_id=s1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_401_when_token_missing(self, client):
+        async with client as c:
+            response = await c.get("/get_messages?session_id=s1")
+
+        assert response.status_code == 401
+
+
+# ── Rename Session ───────────────────────────────────────────
+
+class TestRenameSession:
+    async def test_renames_owned_session(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+        mock_db.session.update = AsyncMock(return_value=Mock(id="s1", business_idea="New Name"))
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="user-123")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/rename_session",
+                        json={"session_id": "s1", "name": "  New Name  "},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 200
+            assert response.json()["business_idea"] == "New Name"
+            mock_db.session.update.assert_awaited_once_with(
+                where={"id": "s1"},
+                data={"business_idea": "New Name"},
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_returns_404_when_session_not_found(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=None),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/rename_session",
+                        json={"session_id": "missing", "name": "X"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/rename_session",
+                        json={"session_id": "s1", "name": "X"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_returns_401_when_token_missing(self, client):
+        async with client as c:
+            response = await c.post("/rename_session", json={"session_id": "s1", "name": "X"})
+
+        assert response.status_code == 401
+
+    async def test_returns_401_when_token_invalid(self, client):
+        async with client as c:
+            response = await c.post(
+                "/rename_session",
+                json={"session_id": "s1", "name": "X"},
+                headers={"Authorization": "Bearer invalid-token"},
+            )
+
+        assert response.status_code == 401
+
+    async def test_returns_422_for_empty_name(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="user-123")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/rename_session",
+                        json={"session_id": "s1", "name": "   "},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 422
+        finally:
+            app.dependency_overrides.clear()
+
+
+# ── Delete Session ───────────────────────────────────────────
+
+class TestDeleteSession:
+    async def test_deletes_session_messages_and_cached_state(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+        mock_db.message.delete_many = AsyncMock()
+        mock_db.session.delete = AsyncMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="user-123")),
+                patch("backend.main.db", mock_db),
+                patch("backend.main.redis.delete", new_callable=AsyncMock) as mock_redis_delete,
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/delete_session",
+                        json={"session_id": "s1"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 200
+            assert response.json()["session_id"] == "s1"
+            mock_redis_delete.assert_awaited_once_with("langgraph_state:s1")
+            mock_db.message.delete_many.assert_awaited_once_with(where={"sessionId": "s1"})
+            mock_db.session.delete.assert_awaited_once_with(where={"id": "s1"})
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_returns_404_when_session_not_found(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=None),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/delete_session",
+                        json={"session_id": "missing"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/delete_session",
+                        json={"session_id": "s1"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_returns_401_when_token_missing(self, client):
+        async with client as c:
+            response = await c.post("/delete_session", json={"session_id": "s1"})
+
+        assert response.status_code == 401
+
+    async def test_returns_401_when_token_invalid(self, client):
+        async with client as c:
+            response = await c.post(
+                "/delete_session",
+                json={"session_id": "s1"},
+                headers={"Authorization": "Bearer invalid-token"},
+            )
+
+        assert response.status_code == 401
+
+
 # ── WebSocket Stream ─────────────────────────────────────────
 
 class TestWebSocketStream:

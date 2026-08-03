@@ -19,3 +19,6 @@ dependencies = [
 [tool.uv.sources]
 db-service = { workspace = true }
 redis-service = { workspace = true }
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
