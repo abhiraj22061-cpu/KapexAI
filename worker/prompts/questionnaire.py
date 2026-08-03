@@ -43,3 +43,45 @@ Example: ["answer 1", "answer 2"]"""
 PARSE_ANSWERS_TEMPLATE = ChatPromptTemplate.from_messages(
     [("human", PARSE_ANSWERS_PROMPT)]
 )
+
+VALIDATE_ANSWERS_PROMPT = """\
+You are validating an entrepreneur's reply to a business questionnaire to keep the interview on track.
+
+Questions:
+{questions}
+
+The entrepreneur replied with:
+{answers}
+
+Decide whether the reply is a genuine attempt to answer the questions with business-related content.
+
+Mark it INVALID if it is:
+- gibberish, random characters, or filler (e.g. "asdf", "bla bla", lorem ipsum, repeated keystrokes)
+- completely off-topic or unrelated to the questions
+- a refusal to answer, or an attempt to change the subject or derail the questionnaire
+
+Mark it VALID if it answers at least one question meaningfully, even if partial or incomplete.
+
+Return ONLY valid JSON, nothing else:
+{{"valid": true|false, "reason": "<short explanation>"}}"""
+
+VALIDATE_ANSWERS_TEMPLATE = ChatPromptTemplate.from_messages(
+    [("human", VALIDATE_ANSWERS_PROMPT)]
+)
+
+IS_IDEA_PROMPT = """\
+You determine whether an entrepreneur's message contains an actual business idea worth a business questionnaire.
+
+Message:
+{idea}
+
+Mark real_idea as true when the message describes a business, product, service, or a business question/help request with meaningful content (e.g. "I want to open a coffee shop in Pune", "an app that helps people meal-plan", "help me with pricing for my bakery").
+
+Mark real_idea as false when the message is just a command to start the questionnaire (e.g. "start the business questionnaire", "begin the questionnaire", "questionnaire"), a greeting, small talk, gibberish, or empty.
+
+Return ONLY valid JSON, nothing else:
+{{"real_idea": true|false}}"""
+
+IS_IDEA_TEMPLATE = ChatPromptTemplate.from_messages(
+    [("human", IS_IDEA_PROMPT)]
+)

@@ -10,7 +10,7 @@ from redis_service import connect_redis, disconnect_redis, redis
 from worker.agent import build_graph, load_state, process_job
 from worker.agents.chat_agent import ChatAgent
 from worker.agents.router_agent import RouterAgent
-from worker.helpers.messages import business_context
+from worker.helpers.messages import business_context, questionnaire_pending
 from worker.helpers.persistence import add_message, build_state_from_db
 from worker.tools.questionnaire_tool import QuestionnaireTool
 from worker.tools.web_search_tool import WebSearchTool
@@ -184,6 +184,140 @@ def test_first_message_greeting_goes_to_chat(monkeypatch):
     _run(scenario())
 
 
+def test_questionnaire_rejects_nonsense_answers(monkeypatch):
+    """Gibberish replies must not be absorbed into business context: the
+    questionnaire stays pending and re-asks instead of completing."""
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [{"key": "q1", "question": "Who is your target customer?"}],
+        }
+
+    async def fake_validate(self, questions, answers_text):
+        return answers_text != "bla bal ....."
+
+    async def fake_parse(self, questions, answers_text):
+        return [answers_text]
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "questionnaire"}
+
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await _collect(ps, 3)
+
+            second = await process_job(
+                {"session_id": sid, "user_input": "bla bal ....."}, graph
+            )
+            events2 = await _collect(ps, 3)
+
+            types = [m["type"] for m in second["messages"]]
+            assert "questionnaire_answer" not in types
+            assert "questionnaire_complete" not in types
+            assert "questionnaire_invalid" in types
+            assert types[-1] == "questionnaire"
+            assert questionnaire_pending(second["messages"])
+
+            # The garbage was never folded into the parsed answers.
+            for m in second["messages"]:
+                assert not any(
+                    v == "bla bal ....."
+                    for v in (m.get("answers") or {}).values()
+                )
+
+            # Questionnaire still pending → a real answer next completes it.
+            third = await process_job(
+                {"session_id": sid, "user_input": "Young professionals in Pune"}, graph
+            )
+            await _collect(ps, 3)
+            assert third["messages"][-1]["type"] == "questionnaire_complete"
+            assert (
+                third["messages"][-1]["context"].get("q1")
+                == "Young professionals in Pune"
+            )
+
+            msgs = await db.message.find_many(where={"sessionId": sid})
+            assert sorted(m.agent for m in msgs) == [
+                "TOOL",
+                "TOOL",
+                "TOOL",
+                "TOOL",
+                "TOOL",
+                "TOOL",
+            ]
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_questionnaire_asks_for_idea_when_trigger_phrase(monkeypatch):
+    """A command like 'start the business questionnaire' must not be absorbed
+    as the business idea — the tool asks for the real idea instead."""
+
+    async def fake_is_real_idea(self, idea):
+        return False
+
+    async def fake_plan(self, idea):
+        raise AssertionError("_plan must not run for a trigger phrase")
+
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "questionnaire"}
+
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": "Start the business questionnaire"},
+                graph,
+            )
+            events = await _collect(ps, 2)
+
+            types = [m["type"] for m in result["messages"]]
+            assert "questionnaire_start" not in types
+            assert "questionnaire" not in types
+            assert types[-1] == "chat"  # assistant asks for the real idea
+
+            # No questionnaire context was created, and nothing was folded in.
+            assert business_context(result["messages"]) == {}
+            assert not questionnaire_pending(result["messages"])
+
+            msgs = await db.message.find_many(where={"sessionId": sid})
+            assert [m.agent for m in msgs] == ["TOOL", "TOOL"]
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
 def test_questionnaire_auto_starts_then_collects(monkeypatch):
     async def fake_plan(self, idea):
         return {
@@ -197,11 +331,19 @@ def test_questionnaire_auto_starts_then_collects(monkeypatch):
     async def fake_parse(self, questions, answers_text):
         return ["Young professionals in Pune", "Self-funded"]
 
+    async def fake_validate(self, questions, answers_text):
+        return True
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
     monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
     monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
+    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
     monkeypatch.setattr(RouterAgent, "classify", fake_classify)
 
     async def scenario():
