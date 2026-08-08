@@ -11,6 +11,8 @@ from worker.helpers.json_utils import parse_json
 from worker.helpers.messages import last_message, questionnaire_pending
 from worker.helpers.persistence import update_session_business_idea
 from worker.prompts.questionnaire import (
+    CLARIFY_REQUEST_TEMPLATE,
+    EXPLAIN_QUESTIONS_TEMPLATE,
     IS_IDEA_TEMPLATE,
     MAX_QUESTIONS,
     PARSE_ANSWERS_TEMPLATE,
@@ -118,6 +120,12 @@ class QuestionnaireTool(Tool):
             # persistent re-ask is capped by MAX_REASKS so the interview can
             # never loop forever.
             if not await self._validate(questions, answers_text):
+                # But a question ABOUT the questionnaire itself (e.g. "can you
+                # explain this in clearer words?", "what does X mean?") is not a
+                # bad answer — answer it conversationally and keep the
+                # questionnaire pending instead of rejecting the user.
+                if await self._is_clarification(questions, answers_text):
+                    return await self._explain(questions, facts, answers_text)
                 if attempts.get("__reask__", 0) >= MAX_REASKS:
                     pass  # last resort: accept below
                 else:
@@ -201,6 +209,62 @@ class QuestionnaireTool(Tool):
                 "questions": questions,
                 "facts": facts,
                 "attempts": attempts or {},
+            },
+        ]
+
+    async def _is_clarification(self, questions: list[dict], answers_text: str) -> bool:
+        """True when the user's message is a question ABOUT the questionnaire
+        itself (asking for simpler wording, a term's meaning, an example) rather
+        than an attempt to answer. On a parse hiccup it returns False so the
+        existing invalid-answer path (re-ask) takes over."""
+        if not answers_text.strip():
+            return False
+        chain = CLARIFY_REQUEST_TEMPLATE | self.llm
+        response = await chain.ainvoke(
+            {
+                "questions": json.dumps([q.get("question", "") for q in questions]),
+                "message": answers_text,
+            }
+        )
+        try:
+            data = parse_json(response.content)
+        except (json.JSONDecodeError, IndexError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        return bool(data.get("clarification"))
+
+    async def _explain(self, questions: list[dict], facts: dict, user_text: str) -> list[dict]:
+        """Answers a clarifying question about the questionnaire with a
+        plain-language explanation, keeping the questionnaire pending. Emits the
+        user's question as a `chat` USER bubble and the explanation as a `chat`
+        ASSISTANT bubble — no `questionnaire_answer` is written, so
+        `questionnaire_pending` stays ON and the interview continues."""
+        chain = EXPLAIN_QUESTIONS_TEMPLATE | self.llm
+        response = await chain.ainvoke(
+            {
+                "user_message": user_text,
+                "idea": str(facts.get("business_about", "") or ""),
+                "questions": json.dumps(
+                    [q.get("question", "") for q in questions], indent=2
+                ),
+            }
+        )
+        explanation = str(response.content or "").strip()
+        if not explanation:
+            return self._reask(questions, facts, user_text)
+        return [
+            {
+                "role": "USER",
+                "agent": "TOOL",
+                "type": "chat",
+                "content": user_text,
+            },
+            {
+                "role": "ASSISTANT",
+                "agent": "TOOL",
+                "type": "chat",
+                "content": explanation,
             },
         ]
 

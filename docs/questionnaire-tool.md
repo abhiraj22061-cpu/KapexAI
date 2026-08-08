@@ -352,21 +352,48 @@ shows what happened), then **re-asks the same questions**. Re-emitting
 `questionnaire` keeps `questionnaire_pending` = **ON** — the loop repeats until
 the user gives real answers.
 
-> Both helpers are **synchronous** (no LLM call) — they just return message
-> entries. The LLM decisions happen in `_is_real_idea` / `_validate`.
+### Clarifying questions — "can you explain this in clearer words?"
+
+A message that isn't a genuine answer is **not always a rejection**. In
+`_collect`, when `_validate()` returns `False` the tool first runs
+`_is_clarification()` (a lightweight LLM call, `CLARIFY_REQUEST_TEMPLATE`). If
+the user is asking a question **about the questionnaire itself** — rephrasing
+something in simpler words, what a term means, why it's asked, or an example —
+`_explain()` answers it conversationally instead of re-asking:
+
+```python
+# worker/tools/questionnaire_tool.py — _explain()
+return [
+    {"role": "USER", "agent": "TOOL", "type": "chat", "content": user_text},
+    {"role": "ASSISTANT", "agent": "TOOL", "type": "chat",
+     "content": explanation},   # plain-language rephrase of the questions
+]
+```
+
+It emits two `chat` bubbles (`EXPLAIN_QUESTIONS_TEMPLATE` rephrases each question
+in simple words, focused on the one the user asked about). Because **no**
+`questionnaire_answer` is written, `questionnaire_pending` stays **ON** and the
+interview continues — the user's next message routes back into `_collect`. This
+fixes the trap where *"can you explain this in clear words"* was rejected as a
+botched answer and re-asked. On a `_is_clarification` parse hiccup it returns
+`False`, so the normal re-ask path is the safe fallback.
+
+> Both `_reask` / `_request_idea` helpers are **synchronous** (no LLM call) —
+> they just return message entries. The LLM decisions happen in
+> `_is_real_idea` / `_validate` / `_is_clarification`.
 
 ---
 
-## 8. The five LLM calls (the "brains")
+## 8. The seven LLM calls (the "brains")
 
-All five use the same model (`mistral-small-2506`, `temperature=0`) and are
+All use the same model (`mistral-small-2506`, `temperature=0.1`) and are
 just a prompt template piped into the model. The prompts live in
 `worker/prompts/questionnaire.py`.
 
-> `_validate` and `_parse` are only used for **free-form** answers typed in the
-> composer. Answers from the frontend slide UI arrive as structured `{key,
-> answer}` pairs — they skip *parsing* entirely, but are still individually
-> checked by `_validate_structured`.
+> `_validate`, `_parse`, `_is_clarification` and `_explain` are only used for
+> **free-form** answers typed in the composer. Answers from the frontend slide
+> UI arrive as structured `{key, answer}` pairs — they skip *parsing* entirely,
+> but are still individually checked by `_validate_structured`.
 
 | Method | Prompt template | Input → Output | Failure mode |
 |---|---|---|---|
@@ -375,6 +402,8 @@ just a prompt template piped into the model. The prompts live in
 | `_validate` (`:226`) | `VALIDATE_ANSWERS_TEMPLATE` | questions + free-form reply → `{valid: bool}` | returns `True` (don't block real answers) |
 | `_validate_structured` (`:244`) | `VALIDATE_STRUCTURED_ANSWERS_TEMPLATE` | questions + `[{key, answer}]` → `{key: valid}` | returns `{}` (nothing blocked) |
 | `_parse` (`:216`) | `PARSE_ANSWERS_TEMPLATE` | questions + free-form reply → `[answers]` | raises `TypeError` |
+| `_is_clarification` | `CLARIFY_REQUEST_TEMPLATE` | questions + free-form reply → `{clarification: bool}` | returns `False` (fall back to re-ask) |
+| `_explain` | `EXPLAIN_QUESTIONS_TEMPLATE` | user message + idea + questions → markdown explanation | falls back to `_reask` on empty output |
 
 A typical call looks like:
 
@@ -486,9 +515,19 @@ need no special UI.
 
 1. `router_node`: questionnaire pending → routes straight to the tool (no LLM).
 2. `_collect()` → `_validate(...)` → **false**.
-3. `_reask()` emits `questionnaire_invalid` (USER) + `questionnaire`
+3. `_is_clarification(...)` → **false** (it's nonsense, not a question).
+4. `_reask()` emits `questionnaire_invalid` (USER) + `questionnaire`
    (ASSISTANT) re-asking the same questions → `questionnaire_pending` stays
    **ON**. ✅ Nothing was absorbed.
+
+**Turn 3b** — User (instead): `"1) can you explain this in clear words.."`
+
+1. `router_node`: questionnaire pending → routes straight to the tool.
+2. `_collect()` → `_validate(...)` → **false** (not an answer).
+3. `_is_clarification(...)` → **true** (a question about the questionnaire).
+4. `_explain()` emits two `chat` bubbles: the user's question + a plain-language
+   rephrase of the questions. **No** `questionnaire_invalid` / re-ask.
+   `questionnaire_pending` stays **ON**. ✅ The user is not trapped.
 
 **Turn 4** — The user fills the slide UI and clicks **Submit**. The frontend
 posts `POST /submit_questionnaire_answers` with

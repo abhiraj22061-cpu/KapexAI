@@ -97,6 +97,43 @@ VALIDATE_STRUCTURED_ANSWER_TEMPLATE = ChatPromptTemplate.from_messages(
     [("human", VALIDATE_STRUCTURED_ANSWER_PROMPT)]
 )
 
+CLARIFY_REQUEST_PROMPT = """\
+You keep a business questionnaire interview on track by deciding whether an entrepreneur's message is a clarifying question about the questionnaire itself, rather than an attempt to answer it.
+
+Questions:
+{questions}
+
+The entrepreneur wrote the following message while the questionnaire is still pending:
+{message}
+
+Mark clarification=true when the message is a question ABOUT the questionnaire or its questions — for example asking to rephrase something in simpler words, what a term means, why a question is being asked, how to answer, or an example.
+
+Mark clarification=false when the message is an attempt to answer the questions (even partially, informally, or with "not sure"/"I don't know"), or is gibberish/nonsense.
+
+Return ONLY valid JSON, nothing else:
+{{"clarification": true|false}}"""
+
+CLARIFY_REQUEST_TEMPLATE = ChatPromptTemplate.from_messages(
+    [("human", CLARIFY_REQUEST_PROMPT)]
+)
+
+EXPLAIN_QUESTIONS_PROMPT = """\
+You are a business consultant helping an entrepreneur understand the questionnaire you just asked them. The entrepreneur is confused and asked:
+
+{user_message}
+
+Business idea:
+{idea}
+
+Questions:
+{questions}
+
+Rephrase each question in simple, plain, friendly words that an everyday person can understand, and briefly say why it matters for their business. If the entrepreneur asked about a specific question (e.g. by number or topic), focus your explanation on that one. Keep it short, warm, and encouraging, using markdown bullets. End with a one-line prompt inviting them to answer. Never give up on the questionnaire — you are only clarifying, the interview continues after this."""
+
+EXPLAIN_QUESTIONS_TEMPLATE = ChatPromptTemplate.from_messages(
+    [("human", EXPLAIN_QUESTIONS_PROMPT)]
+)
+
 IS_IDEA_PROMPT = """\
 You determine whether an entrepreneur's message contains an actual business idea worth a business questionnaire.
 

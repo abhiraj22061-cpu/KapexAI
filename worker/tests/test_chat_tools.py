@@ -281,6 +281,93 @@ def test_questionnaire_rejects_nonsense_answers(monkeypatch):
     _run(scenario())
 
 
+def test_questionnaire_answers_clarifying_question(monkeypatch):
+    """A clarifying question about the questionnaire itself (e.g. 'can you
+    explain this in clear words?') must NOT be rejected as a bad answer and
+    re-asked. It gets a plain-language explanation while the questionnaire stays
+    pending, so a real answer on the next turn completes it."""
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [{"key": "q1", "question": "Who is your target customer?"}],
+        }
+
+    async def fake_validate(self, questions, answers_text):
+        return "clear words" not in answers_text
+
+    async def fake_is_clarification(self, questions, answers_text):
+        return "clear words" in answers_text
+
+    async def fake_explain(self, questions, facts, user_text):
+        return [
+            {"role": "USER", "agent": "TOOL", "type": "chat", "content": user_text},
+            {
+                "role": "ASSISTANT",
+                "agent": "TOOL",
+                "type": "chat",
+                "content": "In simple terms, I'd like to know who your shop is for. "
+                "For example, students, working professionals, or tourists.",
+            },
+        ]
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "questionnaire"}
+
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireTool, "_is_clarification", fake_is_clarification)
+    monkeypatch.setattr(QuestionnaireTool, "_explain", fake_explain)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await _collect(ps, 3)
+
+            second = await process_job(
+                {"session_id": sid, "user_input": "1) can you explain this in clear words.."},
+                graph,
+            )
+            await _collect(ps, 2)
+
+            types = [m["type"] for m in second["messages"]]
+            # The clarifying question is answered conversationally — no
+            # questionnaire_invalid rejection, no completion, still pending.
+            assert "questionnaire_invalid" not in types
+            assert "questionnaire_complete" not in types
+            assert "questionnaire_answer" not in types
+            assert types[-2:] == ["chat", "chat"]
+            assert "simple terms" in second["messages"][-1]["content"].lower()
+            assert questionnaire_pending(second["messages"])
+
+            # A real answer on the next turn completes the questionnaire.
+            third = await process_job(
+                {"session_id": sid, "user_input": "Young professionals in Pune"}, graph
+            )
+            await _collect(ps, 3)
+            assert third["messages"][-1]["type"] == "questionnaire_complete"
+            assert (
+                third["messages"][-1]["context"].get("q1")
+                == "Young professionals in Pune"
+            )
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
 def test_questionnaire_asks_for_idea_when_trigger_phrase(monkeypatch):
     """A command like 'start the business questionnaire' must not be absorbed
     as the business idea — the tool asks for the real idea instead."""
