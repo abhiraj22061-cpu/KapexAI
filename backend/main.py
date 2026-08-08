@@ -19,6 +19,7 @@ from .models.models import (
     WaitlistSignup,
     CreateChatSession,
     UserChatMessage,
+    SubmitQuestionnaireAnswersRequest,
     RenameSessionRequest,
     DeleteSessionRequest,
 )
@@ -93,6 +94,32 @@ async def push_chat_message(user_data: UserChatMessage, current_user = Depends(g
         )
 
     job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": user_data.content}
+    await redis.lpush("jobs:queue", json.dumps(job))
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={"message": "success", "session_id": session.id, "job_id": job["job_id"]},
+    )
+
+@app.post("/submit_questionnaire_answers")
+async def submit_questionnaire_answers(user_data: SubmitQuestionnaireAnswersRequest, current_user = Depends(get_current_user)):
+    """Submits structured questionnaire answers for a session. The answers are
+    pushed as a job whose `user_input` carries a structured payload, so the
+    worker can fold them into the business context without re-parsing free text."""
+    session = await get_session(user_data.session_id)
+    if not session or session.userId != current_user.id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "session not found for user"},
+        )
+
+    payload = json.dumps(
+        {
+            "kind": "questionnaire_answers",
+            "answers": [{"key": a.key, "answer": a.answer} for a in user_data.answers],
+        }
+    )
+    job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": payload}
     await redis.lpush("jobs:queue", json.dumps(job))
 
     return JSONResponse(

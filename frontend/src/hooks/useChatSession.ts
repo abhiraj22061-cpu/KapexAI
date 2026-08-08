@@ -6,10 +6,17 @@ import {
   getSessions,
   pushMessage,
   renameSession as apiRenameSession,
+  submitQuestionnaireAnswers as apiSubmitQuestionnaireAnswers,
   wsUrl,
 } from '../lib/api'
 import { useAuth } from '../lib/auth'
-import type { ChatMessage, SessionInfo, StreamFrame, ToolInfo } from '../lib/types'
+import type {
+  ChatMessage,
+  QuestionnaireAnswer,
+  SessionInfo,
+  StreamFrame,
+  ToolInfo,
+} from '../lib/types'
 
 type ChatSessionState = {
   sessions: SessionInfo[]
@@ -26,6 +33,7 @@ type ChatSessionState = {
   renameSession: (id: string, name: string) => Promise<void>
   deleteSession: (id: string) => Promise<void>
   sendMessage: (text: string) => Promise<void>
+  submitQuestionnaireAnswers: (answers: QuestionnaireAnswer[]) => Promise<void>
   startNewChat: () => void
 }
 
@@ -43,6 +51,7 @@ export function useChatSession(): ChatSessionState {
   const [error, setError] = useState<string | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
+  const sendingRef = useRef(false)
 
   useEffect(() => () => wsRef.current?.close(), [])
 
@@ -238,6 +247,36 @@ export function useChatSession(): ChatSessionState {
     [activeSessionId, token, streaming, sending, refreshSessions, streamSession],
   )
 
+  const submitQuestionnaireAnswers = useCallback(
+    async (answers: QuestionnaireAnswer[]) => {
+      if (!token || !activeSessionId || streaming || sending) return
+      if (sendingRef.current) return
+      sendingRef.current = true
+      setSending(true)
+      setError(null)
+      // Optimistically echo the answers (mirrors the worker's `_format_answers`).
+      const content = answers
+        .map((a, i) => `${i + 1}) ${a.answer || 'Skipped'}`)
+        .join('\n')
+      setMessages((prev) => [
+        ...prev,
+        { role: 'USER', type: 'questionnaire_answer', content },
+      ])
+      try {
+        await apiSubmitQuestionnaireAnswers(token, activeSessionId, answers)
+        streamSession(activeSessionId)
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : 'Could not submit the questionnaire',
+        )
+      } finally {
+        sendingRef.current = false
+        setSending(false)
+      }
+    },
+    [activeSessionId, token, streaming, sending, streamSession],
+  )
+
   return {
     sessions,
     activeSessionId,
@@ -253,6 +292,7 @@ export function useChatSession(): ChatSessionState {
     renameSession,
     deleteSession,
     sendMessage,
+    submitQuestionnaireAnswers,
     startNewChat,
   }
 }

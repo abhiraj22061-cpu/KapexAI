@@ -15,6 +15,14 @@ class UserChatMessage(BaseModel):
     session_id: str
     content: str
 
+class QuestionnaireAnswer(BaseModel):
+    key: str
+    answer: str
+
+class SubmitQuestionnaireAnswersRequest(BaseModel):
+    session_id: str
+    answers: list[QuestionnaireAnswer]
+
 class RenameSessionRequest(BaseModel):
     session_id: str
     name: str

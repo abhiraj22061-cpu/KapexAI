@@ -410,6 +410,166 @@ class TestPushChatMessage:
             app.dependency_overrides.clear()
 
 
+# ── Submit Questionnaire Answers ─────────────────────────────
+
+class TestSubmitQuestionnaireAnswers:
+    @pytest.mark.asyncio
+    async def test_submits_structured_answers(self, client):
+        session_id = "session-900"
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id=session_id, userId="user-123")),
+                patch("backend.main.uuid4", return_value="job-900"),
+                patch("backend.main.redis.lpush", new_callable=AsyncMock) as mock_lpush,
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/submit_questionnaire_answers",
+                        json={
+                            "session_id": session_id,
+                            "answers": [
+                                {"key": "q1", "answer": "dried mango"},
+                                {"key": "q2", "answer": "local farms"},
+                            ],
+                        },
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 201
+            data = response.json()
+            assert data["session_id"] == session_id
+            assert data["job_id"] == "job-900"
+            payload = json.dumps(
+                {
+                    "kind": "questionnaire_answers",
+                    "answers": [
+                        {"key": "q1", "answer": "dried mango"},
+                        {"key": "q2", "answer": "local farms"},
+                    ],
+                }
+            )
+            mock_lpush.assert_called_once_with(
+                "jobs:queue",
+                json.dumps(
+                    {"job_id": "job-900", "session_id": session_id, "user_input": payload}
+                ),
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_401_when_token_missing(self, client):
+        async with client as c:
+            response = await c.post(
+                "/submit_questionnaire_answers",
+                json={"session_id": "s1", "answers": [{"key": "q1", "answer": "x"}]},
+            )
+
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_not_found(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=None),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/submit_questionnaire_answers",
+                        json={"session_id": "missing", "answers": [{"key": "q1", "answer": "x"}]},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/submit_questionnaire_answers",
+                        json={"session_id": "s1", "answers": [{"key": "q1", "answer": "x"}]},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_422_when_answers_missing(self, client):
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.post(
+                        "/submit_questionnaire_answers",
+                        json={"session_id": "s1"},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 422
+        finally:
+            app.dependency_overrides.clear()
+
+
 # ── Get Sessions ─────────────────────────────────────────────
 
 class TestGetSessions:

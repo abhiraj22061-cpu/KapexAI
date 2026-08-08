@@ -34,8 +34,9 @@ The backend pushes jobs to a Redis list. The worker block-pops them.
 
 ### Backend — enqueue
 
-`POST /create_chat_session` and `POST /push_chat_message` both enqueue the same
-job shape (`backend/main.py`):
+`POST /create_chat_session`, `POST /push_chat_message` and
+`POST /submit_questionnaire_answers` all enqueue the same job shape
+(`backend/main.py`):
 
 ```python
 job = {
@@ -45,6 +46,11 @@ job = {
 }
 await redis.lpush("jobs:queue", json.dumps(job))
 ```
+
+The questionnaire endpoint differs in one way: `user_input` carries a JSON
+payload (`{"kind": "questionnaire_answers", "answers": [{key, answer}, ...]}`)
+instead of free text, so the worker can map the answers onto the questions by
+key without LLM parsing (see `docs/questionnaire-tool.md`).
 
 ### Worker — dequeue
 
@@ -103,7 +109,7 @@ Each message published to `stream:{session_id}` is a JSON string:
 | `type` | Payload | Description |
 |---|---|---|
 | `chat` | `content` | A chat reply |
-| `questionnaire` | `content`, `questions`, `facts` | Questionnaire questions, presented at once |
+| `questionnaire` | `content`, `questions`, `facts` | Questionnaire questions (rendered as a slide UI, one at a time) |
 | `questionnaire_complete` | `content`, `context` | Acknowledges the answers received |
 | `swot` | `content`, `sections`, `summary` | SWOT analysis result |
 | `research` | `content` | Web search result |

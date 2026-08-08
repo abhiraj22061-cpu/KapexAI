@@ -5,14 +5,17 @@ import { MessageList } from '../components/chat/MessageList'
 import { NewChatHero } from '../components/chat/NewChatHero'
 import { Sidebar } from '../components/chat/Sidebar'
 import { Suggestions } from '../components/chat/Suggestions'
+import { TabBlockedOverlay } from '../components/chat/TabBlockedOverlay'
 import { TypingIndicator } from '../components/chat/TypingIndicator'
 import { useAuth } from '../lib/auth'
 import type { ToolInfo } from '../lib/types'
 import { useChatSession } from '../hooks/useChatSession'
+import { useSingleTab } from '../hooks/useSingleTab'
 
 export function ChatPage() {
   const { user, signOut } = useAuth()
   const chat = useChatSession()
+  const { blocked, claimTab } = useSingleTab()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -24,6 +27,17 @@ export function ChatPage() {
 
   function handleSuggestion(tool: ToolInfo) {
     chat.sendMessage(tool.example)
+  }
+
+  function handleClaim() {
+    // Take over the session here and resync this tab with the latest state.
+    claimTab()
+    chat.refreshSessions()
+    if (chat.activeSessionId) chat.selectSession(chat.activeSessionId)
+  }
+
+  if (blocked) {
+    return <TabBlockedOverlay onClaim={handleClaim} />
   }
 
   return (
@@ -59,7 +73,12 @@ export function ChatPage() {
               {chat.loadingMessages ? (
                 <div className="message-loading">Loading conversation…</div>
               ) : (
-                <MessageList messages={chat.messages} />
+                <MessageList
+                  messages={chat.messages}
+                  sessionId={chat.activeSessionId ?? undefined}
+                  streaming={chat.streaming}
+                  onSubmitQuestionnaire={chat.submitQuestionnaireAnswers}
+                />
               )}
               {chat.streaming && <TypingIndicator />}
               {chat.suggestions.length > 0 && (

@@ -91,6 +91,8 @@ Functional end-to-end pipeline with Google OAuth authentication and a working fr
    - `chat` — `chat_agent` (business-consultant persona) replies conversationally; the reply is saved as a `Message` and streamed.
    - `tool` — dispatch to a registered tool (see `worker/tools/registry.py`). Each tool returns message entries with its own JSON shape (`type` + extra fields); `tool_node` persists and streams them.
    - The **router** sends greetings/small talk to the chat agent (which stays strictly business-focused) and routes a shared business idea to the **questionnaire tool** to build context; while questions are pending, answers are routed back to it automatically.
+   - Tools that need business context (`swot`, `web_search`, marked `requires_context = True` on the `Tool`) are **gated**: they only run after the questionnaire completes (`questionnaire_complete`); before that the router redirects the request to the questionnaire tool so context exists first.
+   - The questionnaire answers are collected by the frontend **slide UI** (one question at a time) and submitted as structured `{key, answer}` pairs via `POST /submit_questionnaire_answers`; the worker maps them into context by key without LLM parsing, but validates each non-empty answer per-question (gibberish is rejected and re-asked, never absorbed). Free-form typed answers fall back to LLM validation/parsing.
    - Every chat/tool turn ends by streaming a `suggestions` event listing available tools (name + example + suggestion phrase) and an `end` event.
 4. **Streaming** — each node publishes to pub/sub channel `stream:{session_id}`; the backend WebSocket endpoint `ws/session/{session_id}` forwards it to the client.
 5. **State** — a **message log** (`messages`) is cached in Redis (`langgraph_state:{session_id}`, 24h TTL) and rebuilt from DB message history (ordered by `created_at`) via `worker/helpers/persistence.py`. Each log entry is `{role, agent, type, content, ...tool-specific fields}`.
@@ -100,7 +102,7 @@ Functional end-to-end pipeline with Google OAuth authentication and a working fr
 
 | File | Description |
 |---|---|
-| `backend/main.py` | FastAPI app: `/health`, `/waitlist`, `/create_chat_session`, `/push_chat_message`, `/get_sessions`, `/get_messages`, `/rename_session`, `/delete_session`, `ws/session/{session_id}` |
+| `backend/main.py` | FastAPI app: `/health`, `/waitlist`, `/create_chat_session`, `/push_chat_message`, `/submit_questionnaire_answers`, `/get_sessions`, `/get_messages`, `/rename_session`, `/delete_session`, `ws/session/{session_id}` |
 | `backend/utils/jwt_utils.py` | JWT token creation and verification using python-jose (HS256, 7-day expiry) |
 | `backend/middleware/auth.py` | FastAPI `get_current_user` dependency — extracts Bearer token, decodes JWT, fetches user from DB |
 | `backend/routers/auth.py` | Google OAuth endpoints: `/auth/google` (popup ID token), `/auth/google/callback`, `/auth/me` |

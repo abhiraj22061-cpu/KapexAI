@@ -27,9 +27,9 @@ const registry: Record<string, ComponentType<MessageComponentProps>> = {
   research: ResearchCard,
 }
 
-export function MessageContent({ message }: MessageComponentProps) {
-  const Component = registry[message.type] ?? MarkdownMessage
-  return <Component message={message} />
+export function MessageContent(props: MessageComponentProps) {
+  const Component = registry[props.message.type] ?? MarkdownMessage
+  return <Component {...props} />
 }
 
 export { registry }

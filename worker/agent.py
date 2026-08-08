@@ -15,6 +15,7 @@ from worker.helpers.messages import (
     append_message,
     business_context,
     format_transcript,
+    questionnaire_complete,
     questionnaire_pending,
 )
 from worker.helpers.persistence import (
@@ -48,14 +49,25 @@ async def router_node(state: State) -> dict:
     """Routes the user's message to a chat reply or a specific tool. On a fresh
     session the LLM decides whether to greet (chat) or kick off the
     questionnaire; while a questionnaire is pending, answers are routed back to
-    it automatically."""
+    it automatically. Tools that need business context (SWOT, web research) are
+    gated: until the questionnaire is completed they are redirected to the
+    questionnaire tool so context exists before the tool runs."""
     if questionnaire_pending(state["messages"]):
         return {"intent": "tool", "tool": "questionnaire"}
+    
     decision = await router_agent.classify(
         state["user_input"], state["messages"], list_tools()
     )
+
     if decision.get("intent") == "tool" and get_tool(decision.get("tool", "")):
+        tool = get_tool(decision["tool"])
+        
+        if tool.name == "questionnaire" and questionnaire_complete(state["messages"]):
+            return {"intent": "chat"}
+        if tool.requires_context and not questionnaire_complete(state["messages"]):
+            return {"intent": "tool", "tool": "questionnaire"}
         return {"intent": "tool", "tool": decision["tool"]}
+    
     return {"intent": "chat"}
 
 
@@ -84,7 +96,10 @@ async def chat_node(state: State) -> dict:
     )
 
     await publish_stream(session_id, {"type": "chat", "content": reply})
-    await publish_suggestions(session_id)
+
+    if questionnaire_complete(state["messages"]):
+        await publish_suggestions(session_id, state["messages"])
+
     await publish_stream(session_id, {"type": "end"})
     return {"messages": messages}
 
@@ -109,13 +124,20 @@ async def tool_node(state: State) -> dict:
         if entry.get("role") == "ASSISTANT":
             await publish_stream(session_id, content)
 
-    await publish_suggestions(session_id)
+    if questionnaire_complete(messages):
+        await publish_suggestions(session_id, messages)
+
     await publish_stream(session_id, {"type": "end"})
     return {"messages": messages}
 
 
-async def publish_suggestions(session_id: str) -> None:
-    await publish_stream(session_id, {"type": "suggestions", "tools": list_tools()})
+async def publish_suggestions(session_id: str, messages: list[dict]) -> None:
+    """Streams the available tool suggestions. The questionnaire tool is left
+    out once it has been completed — re-offering it would be pointless."""
+    tools = list_tools()
+    if questionnaire_complete(messages):
+        tools = [t for t in tools if t["name"] != "questionnaire"]
+    await publish_stream(session_id, {"type": "suggestions", "tools": tools})
 
 
 def route(state: State) -> str:

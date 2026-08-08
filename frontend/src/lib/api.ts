@@ -1,4 +1,4 @@
-import type { AuthenticatedUser, ChatMessage, SessionInfo } from './types'
+import type { AuthenticatedUser, ChatMessage, QuestionnaireAnswer, SessionInfo } from './types'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -95,6 +95,21 @@ export function pushMessage(
     body: { session_id: sessionId, content },
     token,
   })
+}
+
+export function submitQuestionnaireAnswers(
+  token: string,
+  sessionId: string,
+  answers: QuestionnaireAnswer[],
+): Promise<{ session_id: string; job_id: string }> {
+  return request<{ session_id: string; job_id: string }>(
+    '/submit_questionnaire_answers',
+    {
+      method: 'POST',
+      body: { session_id: sessionId, answers },
+      token,
+    },
+  )
 }
 
 export function getMessages(
