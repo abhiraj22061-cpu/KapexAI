@@ -368,6 +368,98 @@ def test_questionnaire_answers_clarifying_question(monkeypatch):
     _run(scenario())
 
 
+def test_questionnaire_structured_clarification_explains(monkeypatch):
+    """The deck's 'explain in simpler words' button sends a structured
+    clarification payload; the tool explains the requested questions with chat
+    bubbles and keeps the questionnaire pending (no rejection, no completion)."""
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [
+                {"key": "q1", "question": "What product?"},
+                {"key": "q2", "question": "Who is your target customer?"},
+            ],
+        }
+
+    async def fake_explain(self, questions, facts, user_text):
+        return [
+            {"role": "USER", "agent": "TOOL", "type": "chat", "content": user_text},
+            {
+                "role": "ASSISTANT",
+                "agent": "TOOL",
+                "type": "chat",
+                "content": "In plain words, I want to know who you will sell to.",
+            },
+        ]
+
+    async def fake_validate_structured(self, questions, answers):
+        return {a["key"]: True for a in answers}
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "questionnaire"}
+
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireTool, "_explain", fake_explain)
+    monkeypatch.setattr(
+        QuestionnaireTool, "_validate_structured", fake_validate_structured
+    )
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await _collect(ps, 3)
+
+            payload = json.dumps(
+                {"kind": "questionnaire_clarification", "keys": ["q2"]}
+            )
+            second = await process_job(
+                {"session_id": sid, "user_input": payload}, graph
+            )
+            await _collect(ps, 2)
+
+            types = [m["type"] for m in second["messages"]]
+            assert "questionnaire_invalid" not in types
+            assert "questionnaire_complete" not in types
+            assert "questionnaire_answer" not in types
+            assert types[-2:] == ["chat", "chat"]
+            assert "plain words" in second["messages"][-1]["content"]
+            assert questionnaire_pending(second["messages"])
+
+            # The deck can still be answered afterwards.
+            answers_payload = json.dumps(
+                {
+                    "kind": "questionnaire_answers",
+                    "answers": [
+                        {"key": "q1", "answer": "custom apparel"},
+                        {"key": "q2", "answer": "local event organizers"},
+                    ],
+                }
+            )
+            third = await process_job(
+                {"session_id": sid, "user_input": answers_payload}, graph
+            )
+            await _collect(ps, 2)
+            assert third["messages"][-1]["type"] == "questionnaire_complete"
+            assert third["messages"][-1]["context"]["q2"] == "local event organizers"
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
 def test_questionnaire_asks_for_idea_when_trigger_phrase(monkeypatch):
     """A command like 'start the business questionnaire' must not be absorbed
     as the business idea — the tool asks for the real idea instead."""

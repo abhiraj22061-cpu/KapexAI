@@ -112,6 +112,21 @@ export function submitQuestionnaireAnswers(
   )
 }
 
+export function submitQuestionnaireClarification(
+  token: string,
+  sessionId: string,
+  keys: string[],
+): Promise<{ session_id: string; job_id: string }> {
+  return request<{ session_id: string; job_id: string }>(
+    '/submit_questionnaire_clarification',
+    {
+      method: 'POST',
+      body: { session_id: sessionId, keys },
+      token,
+    },
+  )
+}
+
 export function getMessages(
   token: string,
   sessionId: string,

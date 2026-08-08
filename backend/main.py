@@ -21,6 +21,7 @@ from .models.models import (
     CreateChatSession,
     UserChatMessage,
     SubmitQuestionnaireAnswersRequest,
+    SubmitQuestionnaireClarificationRequest,
     RenameSessionRequest,
     DeleteSessionRequest,
 )
@@ -147,6 +148,30 @@ async def submit_questionnaire_answers(user_data: SubmitQuestionnaireAnswersRequ
         f"{i + 1}) {a.answer or 'Skipped'}" for i, a in enumerate(user_data.answers)
     )
     await mark_pending(session.id, content, "questionnaire_answer")
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED,
+        content={"message": "success", "session_id": session.id, "job_id": job["job_id"]},
+    )
+
+@app.post("/submit_questionnaire_clarification")
+async def submit_questionnaire_clarification(user_data: SubmitQuestionnaireClarificationRequest, current_user = Depends(get_current_user)):
+    """Requests a plain-language explanation of specific questionnaire questions.
+    Pushed as a structured job so the worker can explain without re-parsing free
+    text or rejecting the request as a bad answer."""
+    session = await get_session(user_data.session_id)
+    if not session or session.userId != current_user.id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "session not found for user"},
+        )
+
+    payload = json.dumps(
+        {"kind": "questionnaire_clarification", "keys": user_data.keys}
+    )
+    job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": payload}
+    await redis.lpush("jobs:queue", json.dumps(job))
+    await mark_pending(session.id, "Asked for a simpler explanation", "chat")
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,

@@ -17,6 +17,7 @@ export function QuestionnaireCard({
   streaming,
   completed,
   onSubmitQuestionnaire,
+  onClarifyQuestion,
 }: MessageComponentProps) {
   const questions = (message.questions ?? []) as QuestionnaireQuestion[]
   const [index, setIndex] = useState(0)
@@ -96,6 +97,22 @@ export function QuestionnaireCard({
         </div>
 
         <h4 className="questionnaire-slide-question">{current.question}</h4>
+
+        {onClarifyQuestion && (
+          <button
+            type="button"
+            className="qn-clarify"
+            onClick={() =>
+              onClarifyQuestion(
+                [current.key],
+                `Could you explain this in simpler words? ${current.question}`,
+              )
+            }
+            disabled={locked}
+          >
+            Explain in simpler words
+          </button>
+        )}
 
         <textarea
           className="questionnaire-slide-input"

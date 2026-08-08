@@ -378,6 +378,26 @@ fixes the trap where *"can you explain this in clear words"* was rejected as a
 botched answer and re-asked. On a `_is_clarification` parse hiccup it returns
 `False`, so the normal re-ask path is the safe fallback.
 
+`_is_clarification` is deliberately **permissive**: a clarification request
+mixed with partial answers (e.g. *"1) can you explain this question again 2)
+local this expand, 1cr"*) still counts as a clarification, so the user is
+explained to instead of being told their whole message didn't answer the
+questions.
+
+### Structured clarification (the deck's "Explain in simpler words" button)
+
+The slide deck exposes an **"Explain in simpler words"** button per question
+(`frontend/src/components/messages/QuestionnaireCard.tsx`). Clicking it posts to
+`POST /submit_questionnaire_clarification` (backend `main.py`) with
+`{session_id, keys: [questionKey]}`. The backend pushes a structured job whose
+`user_input` is `{"kind": "questionnaire_clarification", "keys": [...]}`.
+
+In `_collect`, before the free-form guardrail, `_structured_clarification()`
+recognises this payload and calls `_explain_keys()` — which filters to the
+requested questions and calls `_explain()`. The questionnaire stays pending and
+the user answers via the deck right after. No LLM validation is involved, so the
+request can never be misclassified as a bad answer.
+
 > Both `_reask` / `_request_idea` helpers are **synchronous** (no LLM call) —
 > they just return message entries. The LLM decisions happen in
 > `_is_real_idea` / `_validate` / `_is_clarification`.
@@ -390,10 +410,12 @@ All use the same model (`mistral-small-2506`, `temperature=0.1`) and are
 just a prompt template piped into the model. The prompts live in
 `worker/prompts/questionnaire.py`.
 
-> `_validate`, `_parse`, `_is_clarification` and `_explain` are only used for
-> **free-form** answers typed in the composer. Answers from the frontend slide
-> UI arrive as structured `{key, answer}` pairs — they skip *parsing* entirely,
-> but are still individually checked by `_validate_structured`.
+> `_validate`, `_parse` and `_is_clarification` are only used for **free-form**
+> answers typed in the composer. Answers from the frontend slide UI arrive as
+> structured `{key, answer}` pairs — they skip *parsing* entirely, but are still
+> individually checked by `_validate_structured`. `_explain` is used both by the
+> free-form clarification path and by the deck's structured clarify button
+> (via `_explain_keys`).
 
 | Method | Prompt template | Input → Output | Failure mode |
 |---|---|---|---|
@@ -404,6 +426,8 @@ just a prompt template piped into the model. The prompts live in
 | `_parse` (`:216`) | `PARSE_ANSWERS_TEMPLATE` | questions + free-form reply → `[answers]` | raises `TypeError` |
 | `_is_clarification` | `CLARIFY_REQUEST_TEMPLATE` | questions + free-form reply → `{clarification: bool}` | returns `False` (fall back to re-ask) |
 | `_explain` | `EXPLAIN_QUESTIONS_TEMPLATE` | user message + idea + questions → markdown explanation | falls back to `_reask` on empty output |
+| `_structured_clarification` | — (parses JSON) | text → `list[str]` (keys) or `None` | returns `None` (free-form path) |
+| `_explain_keys` | — (calls `_explain`) | questions + keys → `chat` bubbles | falls back to all questions |
 
 A typical call looks like:
 
@@ -483,11 +507,20 @@ populated. Until then those requests are routed to the questionnaire tool.
 
 The `questionnaire` card renders as a **slide UI** (one question at a time with
 Back / Next / Submit) — see `frontend/src/components/messages/QuestionnaireCard.tsx`.
-When the questionnaire is already completed (or superseded by a re-ask), the
-card renders as a plain read-only list instead. The frontend renders unknown
-types as plain bubbles (see `frontend/src/components/messages/index.tsx`), so
-the two guardrail types (`questionnaire_request` / `questionnaire_invalid`)
-need no special UI.
+Each slide also has an **"Explain in simpler words"** button that requests a
+plain-language explanation of that question (see section 7). When the
+questionnaire is already completed (or superseded by a re-ask), the card renders
+as a plain read-only list instead. The frontend renders unknown types as plain
+bubbles (see `frontend/src/components/messages/index.tsx`), so the two guardrail
+types (`questionnaire_request` / `questionnaire_invalid`) need no special UI.
+
+**The composer is locked while the deck is pending.** `useChatSession` computes
+`questionnairePending` (a `questionnaire` message with no later
+`questionnaire_answer` / `questionnaire_complete`) and `ChatPage` disables the
+main input bar while it's true. The user can't abandon the deck by typing a
+separate message; the only input channels are the deck itself and its
+"Explain in simpler words" button. The composer unlocks once the questionnaire
+completes.
 
 ---
 

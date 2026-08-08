@@ -6,13 +6,13 @@ type MessageListProps = {
   sessionId?: string
   streaming?: boolean
   onSubmitQuestionnaire?: (answers: QuestionnaireAnswer[]) => void
+  onClarifyQuestion?: (keys: string[], prompt: string) => void
 }
 
 type MessageItemProps = MessageListProps & {
   message: ChatMessage
   index: number
 }
-
 function MessageItem({
   message,
   messages,
@@ -20,6 +20,7 @@ function MessageItem({
   sessionId,
   streaming,
   onSubmitQuestionnaire,
+  onClarifyQuestion,
 }: MessageItemProps) {
   if (message.role === 'USER') {
     return (
@@ -50,6 +51,7 @@ function MessageItem({
           streaming={streaming}
           completed={completed}
           onSubmitQuestionnaire={onSubmitQuestionnaire}
+          onClarifyQuestion={onClarifyQuestion}
         />
       </div>
     </div>
@@ -61,6 +63,7 @@ export function MessageList({
   sessionId,
   streaming,
   onSubmitQuestionnaire,
+  onClarifyQuestion,
 }: MessageListProps) {
   return (
     <>
@@ -73,6 +76,7 @@ export function MessageList({
           sessionId={sessionId}
           streaming={streaming}
           onSubmitQuestionnaire={onSubmitQuestionnaire}
+          onClarifyQuestion={onClarifyQuestion}
         />
       ))}
     </>

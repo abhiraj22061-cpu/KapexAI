@@ -23,6 +23,10 @@ class SubmitQuestionnaireAnswersRequest(BaseModel):
     session_id: str
     answers: list[QuestionnaireAnswer]
 
+class SubmitQuestionnaireClarificationRequest(BaseModel):
+    session_id: str
+    keys: list[str]
+
 class RenameSessionRequest(BaseModel):
     session_id: str
     name: str

@@ -104,6 +104,9 @@
 .questionnaire-slide-input { width: 100%; font: inherit; font-size: 16px; color: #18130e; resize: vertical; min-height: 74px; padding: 11px 13px; border-radius: 10px; border: 1px solid rgba(38, 34, 61, .22); background: #fffdf8; outline: none; }
 .questionnaire-slide-input:focus { border-color: #ff936f; box-shadow: 0 0 0 3px rgba(255, 147, 111, .18); }
 .questionnaire-slide-input:disabled { opacity: .65; }
+.qn-clarify { display: inline-block; margin: 4px 0 2px; font: inherit; font-size: 13px; font-weight: 600; color: #b3542f; background: transparent; border: none; padding: 2px 0; cursor: pointer; text-decoration: underline dotted rgba(179, 84, 47, .6); text-underline-offset: 3px; }
+.qn-clarify:hover:not(:disabled) { color: #ff936f; }
+.qn-clarify:disabled { opacity: .45; cursor: default; }
 .questionnaire-slide-nav { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
 .qn-btn { font: inherit; font-weight: 600; font-size: 14px; color: #5a5266; background: transparent; border: 1px solid rgba(38, 34, 61, .2); border-radius: 10px; padding: 9px 18px; cursor: pointer; }
 .qn-btn:hover:not(:disabled) { border-color: #ff936f; color: #b3542f; }

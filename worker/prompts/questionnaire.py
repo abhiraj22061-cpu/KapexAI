@@ -106,9 +106,9 @@ Questions:
 The entrepreneur wrote the following message while the questionnaire is still pending:
 {message}
 
-Mark clarification=true when the message is a question ABOUT the questionnaire or its questions — for example asking to rephrase something in simpler words, what a term means, why a question is being asked, how to answer, or an example.
+Mark clarification=true when the message contains a question ABOUT the questionnaire or its questions — for example asking to rephrase something in simpler words, what a term means, why a question is being asked, how to answer, or an example. This is still true when the user ALSO tried to answer some of the questions in the same message — a clarification request mixed with partial answers is still a clarification request, and the partial answers should not be silently rejected.
 
-Mark clarification=false when the message is an attempt to answer the questions (even partially, informally, or with "not sure"/"I don't know"), or is gibberish/nonsense.
+Mark clarification=false when the message is purely an attempt to answer the questions (even partially, informally, or with "not sure"/"I don't know"), or is gibberish/nonsense with no question about the questionnaire.
 
 Return ONLY valid JSON, nothing else:
 {{"clarification": true|false}}"""

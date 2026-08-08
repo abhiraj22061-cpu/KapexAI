@@ -10,4 +10,6 @@ export type MessageComponentProps = {
   completed?: boolean
   /** Callback for tools that collect user input (e.g. the questionnaire). */
   onSubmitQuestionnaire?: (answers: QuestionnaireAnswer[]) => void
+  /** Ask the worker to explain specific questionnaire questions in simpler words. */
+  onClarifyQuestion?: (keys: string[], prompt: string) => void
 }

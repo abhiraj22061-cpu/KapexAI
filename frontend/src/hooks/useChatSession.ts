@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   createSession,
   deleteSession as apiDeleteSession,
@@ -7,6 +7,7 @@ import {
   pushMessage,
   renameSession as apiRenameSession,
   submitQuestionnaireAnswers as apiSubmitQuestionnaireAnswers,
+  submitQuestionnaireClarification as apiSubmitQuestionnaireClarification,
   wsUrl,
 } from '../lib/api'
 import { useAuth } from '../lib/auth'
@@ -25,6 +26,7 @@ type ChatSessionState = {
   suggestions: ToolInfo[]
   streaming: boolean
   sending: boolean
+  questionnairePending: boolean
   loadingSessions: boolean
   loadingMessages: boolean
   error: string | null
@@ -34,6 +36,7 @@ type ChatSessionState = {
   deleteSession: (id: string) => Promise<void>
   sendMessage: (text: string) => Promise<void>
   submitQuestionnaireAnswers: (answers: QuestionnaireAnswer[]) => Promise<void>
+  clarifyQuestion: (keys: string[], prompt: string) => Promise<void>
   startNewChat: () => void
 }
 
@@ -52,6 +55,22 @@ export function useChatSession(): ChatSessionState {
 
   const wsRef = useRef<WebSocket | null>(null)
   const sendingRef = useRef(false)
+
+  // The questionnaire deck is still awaiting answers when the latest
+  // questionnaire-related message is a `questionnaire` (asked or re-asked) with
+  // no `questionnaire_answer` / `questionnaire_complete` after it.
+  const questionnairePending = useMemo(() => {
+    let pending = false
+    for (const msg of messages) {
+      if (msg.type === 'questionnaire') pending = true
+      else if (
+        msg.type === 'questionnaire_answer' ||
+        msg.type === 'questionnaire_complete'
+      )
+        pending = false
+    }
+    return pending
+  }, [messages])
 
   useEffect(() => () => wsRef.current?.close(), [])
 
@@ -295,6 +314,34 @@ export function useChatSession(): ChatSessionState {
     [activeSessionId, token, streaming, sending, streamSession],
   )
 
+  const clarifyQuestion = useCallback(
+    async (keys: string[], prompt: string) => {
+      if (!token || !activeSessionId || streaming || sending) return
+      if (sendingRef.current) return
+      sendingRef.current = true
+      setSending(true)
+      setError(null)
+      setMessages((prev) => [
+        ...prev,
+        { role: 'USER', type: 'chat', content: prompt },
+      ])
+      try {
+        await apiSubmitQuestionnaireClarification(token, activeSessionId, keys)
+        streamSession(activeSessionId)
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Could not ask for a simpler explanation',
+        )
+      } finally {
+        sendingRef.current = false
+        setSending(false)
+      }
+    },
+    [activeSessionId, token, streaming, sending, streamSession],
+  )
+
   return {
     sessions,
     activeSessionId,
@@ -302,6 +349,7 @@ export function useChatSession(): ChatSessionState {
     suggestions,
     streaming,
     sending,
+    questionnairePending,
     loadingSessions,
     loadingMessages,
     error,
@@ -311,6 +359,7 @@ export function useChatSession(): ChatSessionState {
     deleteSession,
     sendMessage,
     submitQuestionnaireAnswers,
+    clarifyQuestion,
     startNewChat,
   }
 }

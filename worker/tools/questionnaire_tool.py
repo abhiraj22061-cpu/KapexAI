@@ -114,6 +114,14 @@ class QuestionnaireTool(Tool):
                 return self._reask(bad, facts, self._format_answers(bad, submitted), attempts)
             content = self._format_answers(questions, facts)
         else:
+            # Structured "explain this in simpler words" requests (sent by the
+            # deck's clarify button) are answered with a plain-language
+            # explanation of the requested questions — the questionnaire stays
+            # pending so the user can answer right after.
+            clarification_keys = self._structured_clarification(answers_text)
+            if clarification_keys is not None:
+                return await self._explain_keys(questions, facts, clarification_keys)
+
             # Guardrail: if the reply doesn't genuinely answer the questions
             # (gibberish, off-topic, refusal), don't absorb it into the business
             # context. Re-ask instead so the questionnaire stays pending. A
@@ -176,6 +184,23 @@ class QuestionnaireTool(Tool):
             for a in answers
             if isinstance(a, dict) and isinstance(a.get("key"), str)
         ]
+
+    def _structured_clarification(self, text: str) -> list[str] | None:
+        """Parses the structured clarification payload sent by the deck's
+        "explain in simpler words" button. Returns the question keys to explain,
+        or None when `text` is not a clarification payload."""
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(data, dict) or data.get("kind") != "questionnaire_clarification":
+            return None
+        keys = data.get("keys")
+        if not isinstance(keys, list):
+            return None
+        return [k for k in keys if isinstance(k, str)]
 
     def _format_answers(self, questions: list[dict], facts: dict) -> str:
         """Builds a readable summary of the collected answers for the message log."""
@@ -267,6 +292,18 @@ class QuestionnaireTool(Tool):
                 "content": explanation,
             },
         ]
+
+    async def _explain_keys(
+        self, questions: list[dict], facts: dict, keys: list[str]
+    ) -> list[dict]:
+        """Explains only the requested questions (from the deck's clarify
+        button). Unknown keys fall back to explaining all questions."""
+        wanted = [q for q in questions if q.get("key", "") in keys] or questions
+        if len(wanted) == 1:
+            user_text = "Could you please explain this question in simpler words?"
+        else:
+            user_text = "Could you please explain these questions in simpler words?"
+        return await self._explain(wanted, facts, user_text)
 
     def _request_idea(self, raw: str) -> list[dict]:
         return [

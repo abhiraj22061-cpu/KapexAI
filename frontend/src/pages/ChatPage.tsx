@@ -91,6 +91,7 @@ export function ChatPage() {
                   sessionId={chat.activeSessionId ?? undefined}
                   streaming={chat.streaming}
                   onSubmitQuestionnaire={chat.submitQuestionnaireAnswers}
+                  onClarifyQuestion={chat.clarifyQuestion}
                 />
               )}
               {chat.streaming && <TypingIndicator />}
@@ -101,7 +102,14 @@ export function ChatPage() {
             <Composer
               key={chat.activeSessionId}
               onSend={chat.sendMessage}
-              disabled={chat.streaming || chat.sending}
+              disabled={
+                chat.streaming || chat.sending || chat.questionnairePending
+              }
+              placeholder={
+                chat.questionnairePending
+                  ? 'Answer the questions above to continue…'
+                  : undefined
+              }
             />
           </>
         ) : (
