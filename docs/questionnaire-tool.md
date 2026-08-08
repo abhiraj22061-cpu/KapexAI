@@ -61,7 +61,11 @@ User message → router_node → tool_node → QuestionnaireTool.run() → messa
 
   Otherwise it asks an LLM (`router_agent.classify`) whether the message is
   small talk (`chat`) or a request for a tool. The router is told that a new
-  business idea should be routed to the questionnaire tool.
+  business idea — and also "set up / start / build a business" — should be
+  routed to the questionnaire tool, so a user who wants guided setup gets the
+  interview instead of an open-ended "what do you need?". The chat agent also
+  proactively offers the questionnaire when there's no business context yet,
+  rather than repeating "how can I help?".
 
   Finally there is a **context gate**: any tool with `requires_context = True`
   (SWOT, web research) is redirected to the questionnaire tool until a

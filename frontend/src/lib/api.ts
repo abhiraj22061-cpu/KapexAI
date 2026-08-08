@@ -1,4 +1,4 @@
-import type { AuthenticatedUser, ChatMessage, QuestionnaireAnswer, SessionInfo } from './types'
+import type { AuthenticatedUser, ChatMessage, PendingMessage, QuestionnaireAnswer, SessionInfo } from './types'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -115,8 +115,8 @@ export function submitQuestionnaireAnswers(
 export function getMessages(
   token: string,
   sessionId: string,
-): Promise<{ data: ChatMessage[] }> {
-  return request<{ data: ChatMessage[] }>(
+): Promise<{ data: ChatMessage[]; pending: PendingMessage | null }> {
+  return request<{ data: ChatMessage[]; pending: PendingMessage | null }>(
     `/get_messages?session_id=${encodeURIComponent(sessionId)}`,
     { token },
   )

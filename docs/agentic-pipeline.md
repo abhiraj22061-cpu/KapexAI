@@ -53,8 +53,11 @@ Decides how to handle the current message, in priority order:
    reads the tool registry and the transcript, and returns either
    `{"intent": "chat"}` or `{"intent": "tool", "tool": "<name>"}`. If the
    selected tool is not registered, it falls back to `chat`. On a new session
-   the router prompt tells the LLM to send greetings/small talk to `chat` and to
-   route a shared business idea to the `questionnaire` tool.
+   the router prompt tells the LLM to send greetings/small talk to `chat`, to
+   route a shared business idea to the `questionnaire` tool, and to route
+   "set up / start / build a business" to the questionnaire too — so a user who
+   wants guided setup gets the interview instead of an open-ended
+   "what do you need?".
 3. **Context gate** — tools flagged `requires_context = True` (SWOT, web
    research) are only dispatched once the questionnaire has been **completed**
    (`questionnaire_complete` in `worker/helpers/messages.py`). If the user asks
@@ -73,7 +76,10 @@ Runs `ChatAgent` (a strictly business-focused consultant persona). It is given:
 
 It persists the user message and the reply as `CHAT` messages, then streams
 `chat` → `suggestions` → `end`. The persona handles greetings/small talk briefly
-but declines and redirects anything outside business topics.
+but declines and redirects anything outside business topics. It never repeats a
+question it already asked (a vague reply gets a concrete next step instead of the
+same "how can I help?"), and when there is no business context yet it
+proactively offers the guided questionnaire setup rather than looping.
 
 ### `tool_node`
 
@@ -219,6 +225,11 @@ latest request.
 |---|---|---|
 | USER | `research_request` | `content` |
 | ASSISTANT | `research` | `content` |
+
+The research prompt asks for a **concise summary (~300 words)** using short
+bullets, ending with a short **"Next steps"** section that poses **2-3 specific
+follow-up questions** to the user (e.g. about their competitors, target
+demographics, or pricing) so the conversation keeps moving after the result.
 
 ## Streaming protocol
 

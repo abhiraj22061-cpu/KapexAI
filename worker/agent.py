@@ -22,6 +22,7 @@ from worker.helpers.persistence import (
     add_message,
     build_state_from_db,
     get_session,
+    mark_session_active,
     mark_session_failed,
 )
 from worker.tools.registry import get_tool, list_tools
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 STATE_KEY = "langgraph_state:{session_id}"
 STATE_TTL = 60 * 60 * 24  # 24 hours
+PENDING_KEY = "pending:{session_id}"
 
 
 class State(TypedDict):
@@ -199,11 +201,15 @@ async def process_job(job: dict, graph: CompiledStateGraph) -> State:
         state["user_input"] = user_input
         result = await graph.ainvoke(state)
         await save_state(session_id, result)
+        # The job is done — the backend's in-flight marker is no longer needed.
+        await redis.delete(PENDING_KEY.format(session_id=session_id))
+        await mark_session_active(session_id)
         return result
     except Exception:
         logger.exception("Failed to process session %s (job %s)", session_id, job_id)
         try:
             await mark_session_failed(session_id)
+            await redis.delete(PENDING_KEY.format(session_id=session_id))
             await publish_stream(
                 session_id,
                 {

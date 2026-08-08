@@ -80,6 +80,8 @@ export function useChatSession(): ChatSessionState {
 
   const streamSession = useCallback(
     (sessionId: string) => {
+      // Drop any previous socket so overlapping streams can't double-append.
+      closeStream(wsRef.current)
       setStreaming(true)
       setSuggestions([])
       setError(null)
@@ -135,8 +137,24 @@ export function useChatSession(): ChatSessionState {
       setSuggestions([])
       setError(null)
       try {
-        const { data } = await getMessages(token, sessionId)
-        setMessages(data)
+        const { data, pending } = await getMessages(token, sessionId)
+        if (pending) {
+          // The worker is still replying to this session (e.g. from another
+          // tab). Show the in-flight message optimistically and connect to the
+          // live stream so the result arrives in real time.
+          setMessages([
+            ...data,
+            {
+              role: 'USER',
+              type: pending.type ?? 'chat',
+              content: pending.content,
+              pending: true,
+            } as ChatMessage,
+          ])
+          streamSession(sessionId)
+        } else {
+          setMessages(data)
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Could not load messages')
         setMessages([])
@@ -144,7 +162,7 @@ export function useChatSession(): ChatSessionState {
         setLoadingMessages(false)
       }
     },
-    [token],
+    [token, streamSession],
   )
 
   const selectSession = useCallback(

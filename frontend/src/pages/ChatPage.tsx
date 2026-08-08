@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChatHeader } from '../components/chat/ChatHeader'
 import { Composer } from '../components/chat/Composer'
 import { MessageList } from '../components/chat/MessageList'
@@ -17,13 +17,26 @@ export function ChatPage() {
   const chat = useChatSession()
   const { blocked, claimTab } = useSingleTab()
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
 
   const activeSession = chat.sessions.find((s) => s.id === chat.activeSessionId)
 
+  const scrollToBottom = useCallback(() => {
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [])
+
+  // Anchor to the bottom when the user sends a message (streaming starts) so
+  // their bubble and the typing indicator are visible.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [chat.messages, chat.streaming, chat.suggestions])
+    if (chat.streaming) scrollToBottom()
+  }, [chat.streaming, scrollToBottom])
+
+  // When switching sessions, land at the bottom once the history is loaded.
+  // Incoming messages never auto-scroll — the user stays where they are.
+  useEffect(() => {
+    if (!chat.loadingMessages && chat.activeSessionId) scrollToBottom()
+  }, [chat.loadingMessages, chat.activeSessionId, scrollToBottom])
 
   function handleSuggestion(tool: ToolInfo) {
     chat.sendMessage(tool.example)
@@ -69,7 +82,7 @@ export function ChatPage() {
               title={activeSession?.business_idea}
               onMenu={() => setSidebarOpen(true)}
             />
-            <div className="message-scroll">
+            <div className="message-scroll" ref={scrollRef}>
               {chat.loadingMessages ? (
                 <div className="message-loading">Loading conversation…</div>
               ) : (
@@ -84,7 +97,6 @@ export function ChatPage() {
               {chat.suggestions.length > 0 && (
                 <Suggestions suggestions={chat.suggestions} onPick={handleSuggestion} />
               )}
-              <div ref={bottomRef} />
             </div>
             <Composer
               key={chat.activeSessionId}
