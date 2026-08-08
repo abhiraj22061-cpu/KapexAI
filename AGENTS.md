@@ -59,7 +59,7 @@ Schema models: `User`, `Session`, `Message` (with `Role`, `Agent`, `Status` enum
 - Backend connects Redis in its `lifespan` alongside the DB
 - Supports pub/sub — used by the WebSocket endpoint for real-time streaming
 
-Full docs at `docs/agentic-pipeline.md` (router/tools/message log), `docs/services.md`, and `docs/queue-and-streaming.md`.
+Full docs at `docs/agentic-pipeline.md` (router/tools/message log), `docs/services.md`, `docs/queue-and-streaming.md` (jobs/streaming), and `docs/tab-switching.md` (single-tab lock + state resume).
 
 ## Frontend
 
