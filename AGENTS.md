@@ -33,6 +33,7 @@ Frontend deps go in `frontend/package.json` via `npm install <pkg>`.
 - Framework: `pytest` with `pytest-asyncio` for async tests
 - Run backend tests: `.venv/bin/python -m pytest backend/tests/ -q` (on this machine `uv run pytest` resolves to a miniconda interpreter that's missing workspace packages — use `.venv/bin/python` instead)
 - Run worker tests: `PYTHONPATH=. uv run --package worker pytest worker/tests/ -v` (worker tests hit real DB + Redis)
+- A bare `uv sync` only installs the root package's deps (backend's `python-jose`, LangGraph, etc. end up missing). To rebuild the full workspace env run `uv sync --all-packages` (then `make generate` to regenerate the Prisma client).
 - Test files: `backend/tests/test_*.py`, `worker/tests/test_*.py`
 - Frontend: no test framework; verify with `npm run build` (runs `tsc -b`)
 
@@ -91,7 +92,7 @@ Functional end-to-end pipeline with Google OAuth authentication and a working fr
    - `chat` — `chat_agent` (business-consultant persona) replies conversationally; the reply is saved as a `Message` and streamed.
    - `tool` — dispatch to a registered tool (see `worker/tools/registry.py`). Each tool returns message entries with its own JSON shape (`type` + extra fields); `tool_node` persists and streams them.
    - The **router** sends greetings/small talk to the chat agent (which stays strictly business-focused) and routes a shared business idea to the **questionnaire tool** to build context; "set up / start / build a business" is also routed to the questionnaire so new users get the guided setup instead of an open-ended "what do you need?". While questions are pending, answers are routed back to the questionnaire automatically. The chat agent never repeats an already-asked question and, when there's no business context yet, proactively offers the guided setup.
-   - Tools that need business context (`swot`, `web_search`, marked `requires_context = True` on the `Tool`) are **gated**: they only run after the questionnaire completes (`questionnaire_complete`); before that the router redirects the request to the questionnaire tool so context exists first.
+   - Tools that need business context (`swot`, `web_search`, `economics`, `foresight`, marked `requires_context = True` on the `Tool`) are **gated**: they only run after the questionnaire completes (`questionnaire_complete`); before that the router redirects the request to the questionnaire tool so context exists first.
    - The questionnaire answers are collected by the frontend **slide UI** (one question at a time) and submitted as structured `{key, answer}` pairs via `POST /submit_questionnaire_answers`; the worker maps them into context by key without LLM parsing, but validates each non-empty answer per-question (gibberish is rejected and re-asked, never absorbed). Free-form typed answers fall back to LLM validation/parsing.
    - Every chat/tool turn ends by streaming a `suggestions` event listing available tools (name + example + suggestion phrase) and an `end` event.
 4. **Streaming** — each node publishes to pub/sub channel `stream:{session_id}`; the backend WebSocket endpoint `ws/session/{session_id}` forwards it to the client. The socket closes right away if no job is in flight for the session and treats a client disconnecting mid-stream as a normal close.
@@ -115,10 +116,11 @@ Functional end-to-end pipeline with Google OAuth authentication and a working fr
 | `worker/helpers/persistence.py` | Prisma helpers (`get_business_profile`) + DB message-log rebuild for the worker |
 | `worker/helpers/messages.py` | Message-log helpers (transcript, questionnaire state, business profile injection/context) |
 | `worker/helpers/events.py` | Pub/sub stream publishing helpers |
-| `worker/tools/` | Plug-and-play tools: `base.py`, `registry.py`, `questionnaire_tool.py`, `swot_tool.py`, `web_search_tool.py` |
+| `worker/helpers/http_cache.py` | Redis-backed HTTP + TTL cache (`tool_cache:{sha256}` keys) with retry/backoff for the data tools |
+| `worker/tools/` | Plug-and-play tools: `base.py`, `registry.py`, `questionnaire_tool.py`, `swot_tool.py`, `web_search_tool.py`, `economics_tool.py`, `foresight_tool.py` |
 | `worker/prompts/` | LLM prompt templates per agent/tool |
 | `worker/tools/tavily_search.py` | Tavily search tool used by `web_search_tool` |
-| `worker/tests/` | `test_chat_tools.py` — queue/pub-sub, chat, tool, questionnaire, state-rebuild tests |
+| `worker/tests/` | `test_chat_tools.py` — queue/pub-sub, chat, tool, questionnaire, state-rebuild, `http_cache` tests |
 | `backend/tests/` | `test_main.py`, `test_jwt_utils.py`, `test_auth.py`, `test_middleware.py`, `test_db_utils.py` |
 | `frontend/src/lib/api.ts` | Typed HTTP client (`request`, `ApiError`, `wsUrl`, auth/session/waitlist/profile calls) |
 | `frontend/src/lib/auth.tsx` | AuthProvider — Google sign-in, `localStorage` session persistence, 401-only clearing, `profileEmpty` state + `markProfileFilled` |

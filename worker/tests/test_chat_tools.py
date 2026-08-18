@@ -1747,3 +1747,171 @@ def test_foresight_tool_includes_history_and_data(monkeypatch):
         assert captured["summarize"]["raw"]["target"] == "Mars"
 
     _run(scenario())
+
+
+def test_http_cache_key_is_stable_and_unique():
+    """Cache keys ignore header/method casing and parameter order but change
+    when any part of the request differs."""
+    from worker.helpers import http_cache
+
+    k1 = http_cache._cache_key(
+        "GET", "https://api.test/data", {"a": 1, "b": 2}, None, None
+    )
+    k2 = http_cache._cache_key(
+        "get", "https://api.test/data", {"b": 2, "a": 1}, None, None
+    )
+    k3 = http_cache._cache_key(
+        "POST", "https://api.test/data", {"a": 1, "b": 2}, None, None
+    )
+    k4 = http_cache._cache_key(
+        "GET", "https://api.test/data", {"a": 1}, None, None
+    )
+    k5 = http_cache._cache_key(
+        "GET", "https://api.test/data", {"a": 1, "b": 2}, {"X-Token": "t"}, None
+    )
+    assert len(k1) == 64
+    assert k1 == k2
+    assert k1 != k3
+    assert k1 != k4
+    assert k1 != k5
+    assert http_cache._redis_key(k1).startswith(f"{http_cache.TOOL_CACHE_NAMESPACE}:")
+
+
+def test_cached_json_caches_payload_in_redis(monkeypatch):
+    """A second identical call must be served from the Redis TTL cache without
+    re-fetching the remote endpoint."""
+    from worker.helpers import http_cache
+
+    url = "https://api.test/indicator"
+    key = http_cache._redis_key(http_cache._cache_key("GET", url, None, None, None))
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def request(self, method, url_, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+                json=lambda: {"indicator": "GDP", "value": 3.5},
+            )
+
+    client = FakeClient()
+    monkeypatch.setattr(http_cache, "_client", client)
+
+    async def scenario():
+        await redis.delete(key)
+        try:
+            first = await http_cache.cached_json("GET", url, ttl_seconds=60)
+            second = await http_cache.cached_json("GET", url, ttl_seconds=60)
+            stored = await redis.get(key)
+            ttl = await redis.ttl(key)
+            assert first == {"indicator": "GDP", "value": 3.5}
+            assert second == first
+            assert client.calls == 1
+            assert json.loads(stored) == {"indicator": "GDP", "value": 3.5}
+            assert 0 < ttl <= 60
+        finally:
+            await redis.delete(key)
+
+    _run(scenario())
+
+
+def test_cached_json_retries_transient_statuses(monkeypatch):
+    """Transient statuses (429/502/503/504) are retried with backoff before a
+    successful response is returned and cached."""
+    from worker.helpers import http_cache
+
+    url = "https://api.test/flaky"
+    key = http_cache._redis_key(http_cache._cache_key("GET", url, None, None, None))
+    attempts = {"n": 0}
+
+    class FlakyClient:
+        async def request(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                return SimpleNamespace(
+                    status_code=503,
+                    headers={},
+                    raise_for_status=lambda: None,
+                    json=lambda: {},
+                )
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+                json=lambda: {"ok": True},
+            )
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(http_cache, "_client", FlakyClient())
+    monkeypatch.setattr(http_cache.asyncio, "sleep", noop)
+
+    async def scenario():
+        await redis.delete(key)
+        try:
+            payload = await http_cache.cached_json("GET", url, ttl_seconds=30)
+            assert payload == {"ok": True}
+            assert attempts["n"] == 3
+        finally:
+            await redis.delete(key)
+
+    _run(scenario())
+
+
+def test_cached_json_maps_remote_errors_to_tool_service_error(monkeypatch):
+    """Network failures and non-JSON responses surface as ToolServiceError."""
+    from worker.helpers import http_cache
+
+    import httpx
+
+    url = "https://api.test/broken"
+    key = http_cache._redis_key(http_cache._cache_key("GET", url, None, None, None))
+
+    class TimeoutClient:
+        async def request(self, *args, **kwargs):
+            raise httpx.TimeoutException("timed out")
+
+    class BadJsonClient:
+        async def request(self, *args, **kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+                json=lambda: (_ for _ in ()).throw(ValueError("no json")),
+            )
+
+    class HttpStatusClient:
+        async def request(self, *args, **kwargs):
+            response = SimpleNamespace(
+                status_code=403,
+                headers={},
+                json=lambda: {},
+            )
+            response.raise_for_status = lambda: (_ for _ in ()).throw(
+                httpx.HTTPStatusError("403", request=httpx.Request("GET", url), response=response)
+            )
+            return response
+
+    async def scenario():
+        await redis.delete(key)
+        try:
+            monkeypatch.setattr(http_cache, "_client", TimeoutClient())
+            with pytest.raises(http_cache.ToolServiceError, match="failed"):
+                await http_cache.cached_json("GET", url, ttl_seconds=30)
+
+            monkeypatch.setattr(http_cache, "_client", BadJsonClient())
+            with pytest.raises(http_cache.ToolServiceError, match="failed"):
+                await http_cache.cached_json("GET", url, ttl_seconds=30)
+
+            monkeypatch.setattr(http_cache, "_client", HttpStatusClient())
+            with pytest.raises(http_cache.ToolServiceError, match="failed"):
+                await http_cache.cached_json("GET", url, ttl_seconds=30)
+        finally:
+            await redis.delete(key)
+
+    _run(scenario())
