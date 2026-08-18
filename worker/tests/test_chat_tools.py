@@ -20,6 +20,8 @@ from worker.helpers.messages import (
     questionnaire_pending,
 )
 from worker.helpers.persistence import add_message, build_state_from_db
+from worker.tools.economics_tool import EconomicsTool
+from worker.tools.foresight_tool import ForesightTool, future_signpost_matrix
 from worker.tools.questionnaire_tool import QuestionnaireTool
 from worker.tools.swot_tool import SwotTool
 from worker.tools.web_search_tool import WebSearchTool
@@ -156,9 +158,10 @@ def test_chat_flow_persists_and_streams(monkeypatch):
             assert event_types == ["chat", "suggestions", "end"]
             assert events[0]["content"] == "FAKE CHAT REPLY"
             assert {t["name"] for t in events[1]["tools"]} == {
-                "questionnaire",
                 "swot",
                 "web_search",
+                "economics",
+                "foresight",
             }
 
             msgs = await db.message.find_many(where={"sessionId": sid})
@@ -1319,5 +1322,428 @@ def test_business_profile_updates_reflect_on_next_job(monkeypatch):
             await ps.close()
         finally:
             await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_economics_tool_routes_and_streams(monkeypatch):
+    """The economics tool plans a data request, fetches real (mocked) data,
+    summarizes it, persists both message entries, and streams the result."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "economics"}
+
+    async def fake_plan(self, request, context, transcript):
+        return {
+            "operation": "world_bank_indicator",
+            "args": {
+                "country_code": "IN",
+                "indicator_code": "NY.GDP.MKTP.CD",
+                "start_year": 2015,
+                "end_year": 2024,
+            },
+        }
+
+    async def fake_fetch(country_code, indicator_code, start_year, end_year):
+        return {
+            "country_code": "IN",
+            "indicator_code": "NY.GDP.MKTP.CD",
+            "indicator": "GDP (current US$)",
+            "observations": [
+                {"year": 2023, "value": 3.5, "country": "India", "unit": "", "observation_status": None},
+                {"year": 2024, "value": 3.8, "country": "India", "unit": "", "observation_status": None},
+            ],
+            "source": "https://api.worldbank.org/v2/country/IN/indicator/NY.GDP.MKTP.CD",
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        assert "GDP (current US$)" in str(raw)
+        return "India's GDP was steady at ~3.5-3.8 in recent years."
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.economics_tool.fetch_world_bank_indicator", fake_fetch
+    )
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        await add_message(sid, "USER", "TOOL", {"type": "questionnaire_start", "content": TEST_IDEA})
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire", "content": "q", "questions": [{"key": "q1", "question": "who?"}], "facts": {"business_about": TEST_IDEA}},
+        )
+        await add_message(
+            sid, "USER", "TOOL",
+            {"type": "questionnaire_answer", "content": "1) people", "answers": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": "India's GDP growth"}, graph
+            )
+            events = await _collect(ps, 3)
+
+            assert result["messages"][-2]["type"] == "economics_request"
+            assert result["messages"][-1]["type"] == "economics"
+            assert result["messages"][-1]["content"] == (
+                "India's GDP was steady at ~3.5-3.8 in recent years."
+            )
+            assert result["messages"][-1]["data"]["observations"][-1]["year"] == 2024
+            assert result["messages"][-1]["source"].startswith(
+                "https://api.worldbank.org"
+            )
+
+            assert events[0]["type"] == "economics"
+            assert events[0]["content"] == (
+                "India's GDP was steady at ~3.5-3.8 in recent years."
+            )
+            assert events[1]["type"] == "suggestions"
+            assert events[2]["type"] == "end"
+
+            msgs = await db.message.find_many(where={"sessionId": sid})
+            assert [m.agent for m in msgs].count("TOOL") == 6
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_economics_gated_until_questionnaire_complete(monkeypatch):
+    """The economics tool (requires_context=True) must NOT run until the
+    questionnaire is completed — the router redirects to the questionnaire."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "economics"}
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [{"key": "q1", "question": "Who is your target customer?"}],
+        }
+
+    async def fake_econ_run(self, state):
+        raise AssertionError("economics must not run before the questionnaire is completed")
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "run", fake_econ_run)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        request = "India's GDP growth"
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": request}, graph
+            )
+            await _collect(ps, 3)
+
+            types = [m["type"] for m in result["messages"]]
+            assert "economics" not in types
+            assert "economics_request" not in types
+            assert types == ["questionnaire_start", "questionnaire"]
+            assert questionnaire_pending(result["messages"])
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_economics_tool_includes_history_and_data(monkeypatch):
+    """The economics tool passes the business context, the conversation
+    transcript, and the raw API data into the LLM prompts."""
+    captured = {}
+
+    async def fake_plan(self, request, context, transcript):
+        captured["plan"] = {
+            "request": request,
+            "context": context,
+            "transcript": transcript,
+        }
+        return {
+            "operation": "exchange_rate_series",
+            "args": {"base_currency": "INR", "quote_currencies": ["USD"], "group": "month"},
+        }
+
+    async def fake_fetch(base_currency, quote_currencies, start_date, end_date, group):
+        return {
+            "base_currency": "INR",
+            "quote_currencies": ["USD"],
+            "rates": [{"date": "2026-08-01", "base": "INR", "quote": "USD", "rate": 0.012}],
+            "source": "https://api.frankfurter.dev/v2/rates",
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        captured["summarize"] = {"request": request, "raw": raw}
+        return "The INR has been around 0.012 USD."
+
+    tool = EconomicsTool()
+    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.economics_tool.fetch_exchange_rate_series", fake_fetch
+    )
+
+    async def scenario():
+        entries = await tool.run(
+            {
+                "session_id": "s",
+                "user_input": "How has the INR to USD rate moved?",
+                "messages": [
+                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to import goods from the US."},
+                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "importing goods"}},
+                ],
+            }
+        )
+        assert entries[0]["type"] == "economics_request"
+        assert entries[1]["type"] == "economics"
+        assert entries[1]["content"] == "The INR has been around 0.012 USD."
+        assert entries[1]["source"] == "https://api.frankfurter.dev/v2/rates"
+
+        # The business context and transcript reached the plan prompt.
+        assert captured["plan"]["context"]["business_about"] == "importing goods"
+        assert "I plan to import goods from the US." in captured["plan"]["transcript"]
+        # The raw API data reached the summary prompt.
+        assert captured["summarize"]["raw"]["rates"][0]["rate"] == 0.012
+
+    _run(scenario())
+
+
+def test_foresight_tool_routes_and_streams(monkeypatch):
+    """The foresight tool plans a scenario matrix, validates it, summarizes,
+    persists both entries, and streams the result card."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "foresight"}
+
+    async def fake_plan(self, request, context, transcript):
+        return {
+            "operation": "future_signpost_matrix",
+            "args": {
+                "scenarios": [
+                    {
+                        "name": "Steady growth",
+                        "description": "Demand grows steadily",
+                        "probability": 0.6,
+                        "signals": ["repeat orders up"],
+                        "impacts": ["revenue +20%"],
+                        "trigger_actions": ["hire more staff"],
+                    },
+                    {
+                        "name": "Recession",
+                        "description": "Market contracts",
+                        "probability": 0.4,
+                        "signals": ["orders down"],
+                        "impacts": ["revenue -10%"],
+                        "trigger_actions": ["cut costs"],
+                    },
+                ]
+            },
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        assert raw["probability_total"] == 1.0
+        return "Two scenarios ahead: steady growth (60%) or a downturn (40%)."
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(ForesightTool, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightTool, "_summarize", fake_summarize)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        await add_message(sid, "USER", "TOOL", {"type": "questionnaire_start", "content": TEST_IDEA})
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire", "content": "q", "questions": [{"key": "q1", "question": "who?"}], "facts": {"business_about": TEST_IDEA}},
+        )
+        await add_message(
+            sid, "USER", "TOOL",
+            {"type": "questionnaire_answer", "content": "1) people", "answers": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": "scenarios for the next 2 years"}, graph
+            )
+            events = await _collect(ps, 3)
+
+            assert result["messages"][-2]["type"] == "foresight_request"
+            assert result["messages"][-1]["type"] == "foresight"
+            assert len(result["messages"][-1]["data"]["scenarios"]) == 2
+            assert result["messages"][-1]["data"]["probabilities_sum_to_one"] is True
+            assert result["messages"][-1]["data"]["guidance"] == (
+                "Use probabilities as planning judgments, not claims of certainty."
+            )
+
+            assert events[0]["type"] == "foresight"
+            assert events[1]["type"] == "suggestions"
+            assert events[2]["type"] == "end"
+
+            msgs = await db.message.find_many(where={"sessionId": sid})
+            assert [m.agent for m in msgs].count("TOOL") == 6
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_foresight_gated_until_questionnaire_complete(monkeypatch):
+    """The foresight tool (requires_context=True) must NOT run until the
+    questionnaire is completed — the router redirects to the questionnaire."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "foresight"}
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [{"key": "q1", "question": "Who is your target customer?"}],
+        }
+
+    async def fake_foresight_run(self, state):
+        raise AssertionError("foresight must not run before the questionnaire is completed")
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightTool, "run", fake_foresight_run)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        request = "What are the possible futures for my business?"
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": request}, graph
+            )
+            await _collect(ps, 3)
+
+            types = [m["type"] for m in result["messages"]]
+            assert "foresight" not in types
+            assert "foresight_request" not in types
+            assert types == ["questionnaire_start", "questionnaire"]
+            assert questionnaire_pending(result["messages"])
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_future_signpost_matrix_validates():
+    """Probabilities outside [0,1] raise ValueError; valid scenarios are
+    normalized and the sum-to-one flag is reported."""
+    result = future_signpost_matrix(
+        [
+            {"name": "A", "probability": 0.6, "signals": ["x"], "impacts": ["y"], "trigger_actions": ["z"]},
+            {"name": "B", "probability": 0.4},
+        ]
+    )
+    assert len(result["scenarios"]) == 2
+    assert result["probability_total"] == 1.0
+    assert result["probabilities_sum_to_one"] is True
+    assert result["scenarios"][0]["signals"] == ["x"]
+
+    with pytest.raises(ValueError):
+        future_signpost_matrix([{"name": "bad", "probability": 1.5}])
+
+
+def test_foresight_tool_includes_history_and_data(monkeypatch):
+    """The foresight tool passes the business context, the conversation
+    transcript, and the raw analysis into the LLM prompts, and includes the
+    JPL disclaimer for astronomical requests."""
+    captured = {}
+
+    async def fake_plan(self, request, context, transcript):
+        captured["plan"] = {
+            "request": request,
+            "context": context,
+            "transcript": transcript,
+        }
+        return {
+            "operation": "jpl_horizons_ephemeris",
+            "args": {
+                "target": "Mars",
+                "start_time": "2026-08-01",
+                "stop_time": "2026-08-03",
+            },
+        }
+
+    async def fake_fetch(target, start_time, stop_time, step_size, center):
+        return {
+            "target": target,
+            "start_time": start_time,
+            "stop_time": stop_time,
+            "ephemeris": "$$\nSOE\n2026-Aug-01  ...",
+            "source": "https://ssd.jpl.nasa.gov/api/horizons.api",
+            "disclaimer": (
+                "Astronomical data is scientific; astrological interpretation is "
+                "non-scientific and must not drive high-stakes decisions."
+            ),
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        captured["summarize"] = {"request": request, "raw": raw}
+        return "Here are Mars' observable positions; this is not a prediction."
+
+    tool = ForesightTool()
+    monkeypatch.setattr(ForesightTool, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.foresight_tool.fetch_jpl_horizons_ephemeris", fake_fetch
+    )
+
+    async def scenario():
+        entries = await tool.run(
+            {
+                "session_id": "s",
+                "user_input": "Where is Mars this week?",
+                "messages": [
+                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to open a bakery in Pune."},
+                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "a bakery in Pune"}},
+                ],
+            }
+        )
+        assert entries[0]["type"] == "foresight_request"
+        assert entries[1]["type"] == "foresight"
+        assert entries[1]["content"] == "Here are Mars' observable positions; this is not a prediction."
+        assert entries[1]["source"] == "https://ssd.jpl.nasa.gov/api/horizons.api"
+        assert "Astronomical data is scientific" in entries[1]["data"]["disclaimer"]
+
+        assert captured["plan"]["context"]["business_about"] == "a bakery in Pune"
+        assert "I plan to open a bakery in Pune." in captured["plan"]["transcript"]
+        assert captured["summarize"]["raw"]["target"] == "Mars"
 
     _run(scenario())

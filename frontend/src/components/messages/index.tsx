@@ -4,6 +4,8 @@ import { QuestionnaireCard } from './QuestionnaireCard'
 import { QuestionnaireCompleteCard } from './QuestionnaireCompleteCard'
 import { ResearchCard } from './ResearchCard'
 import { SwotCard } from './SwotCard'
+import { EconomicsCard } from './EconomicsCard'
+import { ForesightCard } from './ForesightCard'
 import type { MessageComponentProps } from './types'
 
 /**
@@ -25,6 +27,8 @@ const registry: Record<string, ComponentType<MessageComponentProps>> = {
   questionnaire_complete: QuestionnaireCompleteCard,
   swot: SwotCard,
   research: ResearchCard,
+  economics: EconomicsCard,
+  foresight: ForesightCard,
 }
 
 export function MessageContent(props: MessageComponentProps) {

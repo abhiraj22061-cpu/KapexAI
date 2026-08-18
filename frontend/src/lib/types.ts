@@ -91,6 +91,18 @@ export type StreamFrame =
   | { type: 'questionnaire_complete'; content: string; context: Record<string, string> }
   | { type: 'swot'; content: string; sections: SwotSections; summary?: string }
   | { type: 'research'; content: string }
+  | {
+      type: 'economics'
+      content: string
+      data?: Record<string, unknown>
+      source?: string
+    }
+  | {
+      type: 'foresight'
+      content: string
+      data?: Record<string, unknown>
+      source?: string
+    }
   | { type: 'suggestions'; tools: ToolInfo[] }
   | { type: 'end' }
   | { type: 'error'; job_id: string; content: string }
