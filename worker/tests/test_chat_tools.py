@@ -156,9 +156,9 @@ def test_chat_flow_persists_and_streams(monkeypatch):
             assert event_types == ["chat", "suggestions", "end"]
             assert events[0]["content"] == "FAKE CHAT REPLY"
             assert {t["name"] for t in events[1]["tools"]} == {
-                "questionnaire",
                 "swot",
                 "web_search",
+                "astrology",
             }
 
             msgs = await db.message.find_many(where={"sessionId": sid})
