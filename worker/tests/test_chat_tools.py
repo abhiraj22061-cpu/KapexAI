@@ -1863,6 +1863,96 @@ def test_cached_json_retries_transient_statuses(monkeypatch):
     _run(scenario())
 
 
+def test_prompts_route_general_questions_to_tools_not_business_only():
+    """The router prompt must send factual/data questions to the matching tool
+    (economics for World Bank/GDP data) instead of treating them as chat, and
+    the chat prompt must answer general questions instead of declining them."""
+    from worker.prompts.chat import CHAT_PROMPT
+    from worker.prompts.router import ROUTER_PROMPT
+
+    assert "World Bank indicators or country profiles" in ROUTER_PROMPT
+    assert '-> "economics"' in ROUTER_PROMPT
+    assert '-> "foresight"' in ROUTER_PROMPT
+    assert "Keep the conversation on business topics" not in ROUTER_PROMPT
+    assert "ONLY talk about business" not in CHAT_PROMPT
+    assert "general knowledge" in CHAT_PROMPT
+
+
+def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
+    """With the questionnaire completed, a World Bank country-profile question is
+    answered by the economics tool (from World Bank data) instead of being
+    declined as non-business."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "economics"}
+
+    async def fake_plan(self, request, context, transcript):
+        return {
+            "operation": "world_bank_country_profile",
+            "args": {"country_code": "IN"},
+        }
+
+    async def fake_fetch(country_code):
+        return {
+            "country_code": "IN",
+            "country": "India",
+            "region": "South Asia",
+            "income_level": "Lower middle income",
+            "lending_type": "IBRD",
+            "capital": "New Delhi",
+            "longitude": "77.2",
+            "latitude": "28.6",
+            "source": "https://api.worldbank.org/v2/country/IN",
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        assert raw["country"] == "India"
+        return "India is a Lower middle income economy in South Asia with capital New Delhi."
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.economics_tool.fetch_world_bank_country_profile", fake_fetch
+    )
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire_complete", "content": "done",
+             "context": {"business_about": TEST_IDEA}},
+        )
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {
+                    "session_id": sid,
+                    "user_input": "can you give me world bank country profile for india",
+                },
+                graph,
+            )
+            await _collect(ps, 3)
+
+            assert result["messages"][-2]["type"] == "economics_request"
+            assert result["messages"][-1]["type"] == "economics"
+            assert result["messages"][-1]["content"] == (
+                "India is a Lower middle income economy in South Asia with capital New Delhi."
+            )
+            assert result["messages"][-1]["data"]["income_level"] == "Lower middle income"
+            assert result["messages"][-1]["source"].startswith(
+                "https://api.worldbank.org"
+            )
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
 def test_cached_json_maps_remote_errors_to_tool_service_error(monkeypatch):
     """Network failures and non-JSON responses surface as ToolServiceError."""
     from worker.helpers import http_cache
