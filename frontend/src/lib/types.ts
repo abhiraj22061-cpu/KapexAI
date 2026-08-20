@@ -103,6 +103,7 @@ export type StreamFrame =
       data?: Record<string, unknown>
       source?: string
     }
+  | { type: 'astrology'; content: string; insights: string[]; disclaimer: string }
   | { type: 'suggestions'; tools: ToolInfo[] }
   | { type: 'end' }
   | { type: 'error'; job_id: string; content: string }

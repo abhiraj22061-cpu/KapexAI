@@ -162,6 +162,8 @@
 .foresight-source { display: block; margin-top: 8px; font-size: 12px; color: #8f89a8; }
 .foresight-source a { color: #b3542f; text-decoration: none; }
 .foresight-source a:hover { text-decoration: underline; }
+.astrology-card .markdown { margin-bottom: 2px; }
+.astrology-disclaimer { margin-top: 12px; padding-top: 9px; border-top: 1px dashed rgba(38, 34, 61, .18); font-size: 12.5px; line-height: 1.5; color: #8f89a8; }
 
 /* ── Typing indicator ─────────────────────────────────────── */
 .typing-indicator { display: flex; gap: 5px; align-items: center; padding: 14px 16px; background: #fffdf8; border: 1px solid rgba(38, 34, 61, .1); border-radius: 5px 16px 16px 16px; }
