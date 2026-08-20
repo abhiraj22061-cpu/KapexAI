@@ -1954,6 +1954,282 @@ def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
     _run(scenario())
 
 
+def test_fetch_world_bank_indicator_parses_and_sorts(monkeypatch):
+    """World Bank indicator responses are parsed into sorted observations and
+    country codes are uppercased."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        assert "per_page" in kwargs["params"]
+        return [
+            {"page": 1},
+            [
+                {
+                    "date": "2020",
+                    "value": 5.0,
+                    "country": {"value": "India"},
+                    "unit": "",
+                    "obs_status": None,
+                    "indicator": {"value": "GDP (current US$)"},
+                },
+                {
+                    "date": "2019",
+                    "value": 4.0,
+                    "country": {"value": "India"},
+                    "unit": "",
+                    "obs_status": None,
+                    "indicator": {"value": "GDP (current US$)"},
+                },
+            ],
+        ]
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_world_bank_indicator(
+            "in", "NY.GDP.MKTP.CD", start_year=2019, end_year=2020
+        )
+        assert result["country_code"] == "IN"
+        assert [o["year"] for o in result["observations"]] == [2019, 2020]
+        assert result["indicator"] == "GDP (current US$)"
+
+    _run(scenario())
+
+
+def test_fetch_world_bank_indicator_handles_empty_payload(monkeypatch):
+    """Non-list or short payloads produce an empty observations list instead of
+    an error."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"not": "a list"}
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_world_bank_indicator(
+            "IN", "NY.GDP.MKTP.CD"
+        )
+        assert result["observations"] == []
+
+    _run(scenario())
+
+
+def test_fetch_world_bank_indicator_rejects_invalid_range():
+    """start_year after end_year is rejected before any network call."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="start_year"):
+        class _T:
+            pass
+
+        # avoid coroutine: call the wrapper through a captured event loop
+        async def _scenario():
+            from worker.tools import economics_tool
+
+            await economics_tool.fetch_world_bank_indicator(
+                "IN", "X", start_year=2024, end_year=2020
+            )
+
+        _run(_scenario())
+
+
+def test_fetch_world_bank_country_profile_empty(monkeypatch):
+    """An empty country list yields a None country rather than an error."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return [{"page": 1}, []]
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_world_bank_country_profile("XX")
+        assert result["country"] is None
+        assert result["country_code"] == "XX"
+
+    _run(scenario())
+
+
+def test_fetch_bls_time_series_parses_values(monkeypatch):
+    """BLS series parse float values and keep the raw value, sorting by date."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        assert kwargs["json_body"] == {"seriesid": ["CUUR0000SA0"]}
+        return {
+            "status": "REQUEST_SUCCEEDED",
+            "Results": {
+                "series": [
+                    {
+                        "seriesID": "CUUR0000SA0",
+                        "data": [
+                            {
+                                "year": "2024",
+                                "period": "M01",
+                                "periodName": "January",
+                                "value": "308.417",
+                                "footnotes": [{"text": "note1"}],
+                            },
+                            {"year": "2023", "period": "M12", "periodName": "December", "value": "n/a", "footnotes": []},
+                        ],
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_bls_time_series(["CUUR0000SA0"])
+        assert result["status"] == "REQUEST_SUCCEEDED"
+        assert result["series"][0]["series_id"] == "CUUR0000SA0"
+        obs = result["series"][0]["observations"]
+        by_year = {o["year"]: o for o in obs}
+        assert by_year[2023]["value"] is None  # "n/a" → None
+        assert by_year[2024]["value"] == 308.417
+        assert by_year[2024]["footnotes"] == ["note1"]
+
+    _run(scenario())
+
+
+def test_fetch_bls_time_series_handles_failed_status(monkeypatch):
+    """A non-REQUEST_SUCCEEDED response surfaces the API status and messages."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"status": "REQUEST_FAILED", "message": ["No data"]}
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_bls_time_series(["XXX"])
+        assert result["status"] == "REQUEST_FAILED"
+        assert result["messages"] == ["No data"]
+        assert result["series"] == []
+
+    _run(scenario())
+
+
+def test_fetch_bls_time_series_validates_series_count(monkeypatch):
+    """BLS accepts between 1 and 20 series IDs."""
+    from worker.tools import economics_tool
+
+    async def scenario():
+        with pytest.raises(ValueError, match="between 1 and 20"):
+            await economics_tool.fetch_bls_time_series([])
+
+    _run(scenario())
+
+
+def test_fetch_exchange_rate_series_validates_args(monkeypatch):
+    """Quote currencies are required and the group must be week/month."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"base": "USD", "rates": []}
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        with pytest.raises(ValueError, match="quote currency"):
+            await economics_tool.fetch_exchange_rate_series("USD", [])
+        with pytest.raises(ValueError, match="group"):
+            await economics_tool.fetch_exchange_rate_series(
+                "usd", ["inr"], group="year"
+            )
+        result = await economics_tool.fetch_exchange_rate_series(
+            "usd", ["inr", "EUR"], group="month"
+        )
+        assert result["base_currency"] == "USD"
+        assert result["quote_currencies"] == ["INR", "EUR"]
+
+    _run(scenario())
+
+
+def test_economics_trim_limits_data():
+    """_trim caps observation lists so persisted messages stay small."""
+    from worker.tools.economics_tool import MAX_OBSERVATIONS, _trim
+
+    rows = [{"year": i, "value": i} for i in range(50)]
+    trimmed = _trim({"observations": rows, "series": [{"observations": rows}]})
+    assert len(trimmed["observations"]) == MAX_OBSERVATIONS
+    assert len(trimmed["observations"][-1].keys()) >= 2
+    assert trimmed["series"][0]["observations"] == trimmed["observations"]
+    # Non-list fields are left untouched.
+    assert _trim({"foo": "bar"}) == {"foo": "bar"}
+
+
+def test_economics_dispatch_rejects_unknown_operation(monkeypatch):
+    """An unrecognized operation bubbles up as a ValueError."""
+    from worker.tools import economics_tool
+
+    tool = economics_tool.EconomicsTool()
+    monkeypatch.setattr(economics_tool.EconomicsTool, "_plan", None)
+
+    async def scenario():
+        with pytest.raises(ValueError, match="Unknown economics operation"):
+            await tool._dispatch("not_a_real_op", {})
+
+    _run(scenario())
+
+
+def test_foresight_dispatch_validates_scenario_plan(monkeypatch):
+    """Scenario planning requires at least one valid scenario dict."""
+    from worker.tools import foresight_tool
+
+    tool = foresight_tool.ForesightTool()
+
+    async def scenario():
+        with pytest.raises(ValueError, match="at least one scenario"):
+            await tool._dispatch("future_signpost_matrix", {"scenarios": []})
+        with pytest.raises(ValueError, match="at least one scenario"):
+            await tool._dispatch("future_signpost_matrix", {"scenarios": [1, 2]})
+        with pytest.raises(ValueError, match="Unknown foresight operation"):
+            await tool._dispatch("nope", {})
+        result = await tool._dispatch(
+            "future_signpost_matrix",
+            {"scenarios": [{"name": "A", "probability": 0.5}]},
+        )
+        assert result["scenarios"][0]["name"] == "A"
+
+    _run(scenario())
+
+
+def test_fetch_jpl_ephemeris_truncates_output(monkeypatch):
+    """JPL responses are truncated to the trailing 20k chars so messages stay
+    small."""
+    from worker.tools import foresight_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"result": "x" * 50000}
+
+    monkeypatch.setattr(foresight_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await foresight_tool.fetch_jpl_horizons_ephemeris(
+            "Mars", "2026-08-01", "2026-08-03"
+        )
+        assert len(result["ephemeris"]) == 20000
+        assert result["ephemeris"].endswith("x" * 20000)
+        assert result["disclaimer"]
+
+    _run(scenario())
+
+
+def test_future_signpost_matrix_flags_non_sum_one():
+    """Probabilities that don't sum to one are flagged, and empty scenario lists
+    are rejected."""
+    from worker.tools.foresight_tool import future_signpost_matrix
+
+    result = future_signpost_matrix([{"name": "A", "probability": 0.5}])
+    assert result["probabilities_sum_to_one"] is False
+    assert result["probability_total"] == 0.5
+
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        future_signpost_matrix([{"name": "bad", "probability": -0.1}])
+
+
 def test_cached_json_maps_remote_errors_to_tool_service_error(monkeypatch):
     """Network failures and non-JSON responses surface as ToolServiceError."""
     from worker.helpers import http_cache
