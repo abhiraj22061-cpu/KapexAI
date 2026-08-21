@@ -1,5 +1,6 @@
 from worker.tools.astrology_tool import AstrologyTool
 from worker.tools.base import Tool
+from worker.tools.indian_finance_tool import IndianFinanceTool
 from worker.tools.questionnaire_tool import QuestionnaireTool
 from worker.tools.swot_tool import SwotTool
 from worker.tools.web_search_tool import WebSearchTool
@@ -15,6 +16,7 @@ register(QuestionnaireTool())
 register(SwotTool())
 register(WebSearchTool())
 register(AstrologyTool())
+register(IndianFinanceTool())
 
 
 def get_tool(name: str) -> Tool | None:
