@@ -159,6 +159,7 @@ def test_chat_flow_persists_and_streams(monkeypatch):
             assert {t["name"] for t in events[1]["tools"]} == {
                 "swot",
                 "web_search",
+                "finance",
                 "astrology",
             }
 
@@ -233,6 +234,9 @@ def test_questionnaire_rejects_nonsense_answers(monkeypatch):
     async def fake_parse(self, questions, answers_text):
         return [answers_text]
 
+    async def fake_is_clarification(self, questions, answers_text):
+        return False
+
     async def fake_is_real_idea(self, idea):
         return True
 
@@ -242,6 +246,7 @@ def test_questionnaire_rejects_nonsense_answers(monkeypatch):
     monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
     monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
     monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
+    monkeypatch.setattr(QuestionnaireTool, "_is_clarification", fake_is_clarification)
     monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
     monkeypatch.setattr(RouterAgent, "classify", fake_classify)
 
@@ -332,6 +337,9 @@ def test_questionnaire_answers_clarifying_question(monkeypatch):
             },
         ]
 
+    async def fake_parse(self, questions, answers_text):
+        return [answers_text]
+
     async def fake_is_real_idea(self, idea):
         return True
 
@@ -342,6 +350,7 @@ def test_questionnaire_answers_clarifying_question(monkeypatch):
     monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
     monkeypatch.setattr(QuestionnaireTool, "_is_clarification", fake_is_clarification)
     monkeypatch.setattr(QuestionnaireTool, "_explain", fake_explain)
+    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
     monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
     monkeypatch.setattr(RouterAgent, "classify", fake_classify)
 
