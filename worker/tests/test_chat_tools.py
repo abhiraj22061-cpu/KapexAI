@@ -19,6 +19,8 @@ from worker.helpers.messages import (
     questionnaire_pending,
 )
 from worker.helpers.persistence import add_message, build_state_from_db
+from worker.tools.economics_tool import EconomicsTool
+from worker.tools.foresight_tool import ForesightTool, future_signpost_matrix
 from worker.tools.indian_finance_tool import IndianFinanceTool
 from worker.tools.questionnaire_tool import QuestionnaireTool
 from worker.tools.swot_tool import SwotTool
@@ -139,6 +141,8 @@ def test_chat_flow_persists_and_streams(monkeypatch):
             assert {t["name"] for t in events[1]["tools"]} == {
                 "swot",
                 "web_search",
+                "economics",
+                "foresight",
                 "finance",
                 "astrology",
                 "indian_legal_search",
@@ -1423,5 +1427,962 @@ def test_business_profile_updates_reflect_on_next_job(monkeypatch):
             await ps.close()
         finally:
             await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_economics_tool_routes_and_streams(monkeypatch):
+    """The economics tool plans a data request, fetches real (mocked) data,
+    summarizes it, persists both message entries, and streams the result."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "economics"}
+
+    async def fake_plan(self, request, context, transcript):
+        return {
+            "operation": "world_bank_indicator",
+            "args": {
+                "country_code": "IN",
+                "indicator_code": "NY.GDP.MKTP.CD",
+                "start_year": 2015,
+                "end_year": 2024,
+            },
+        }
+
+    async def fake_fetch(country_code, indicator_code, start_year, end_year):
+        return {
+            "country_code": "IN",
+            "indicator_code": "NY.GDP.MKTP.CD",
+            "indicator": "GDP (current US$)",
+            "observations": [
+                {"year": 2023, "value": 3.5, "country": "India", "unit": "", "observation_status": None},
+                {"year": 2024, "value": 3.8, "country": "India", "unit": "", "observation_status": None},
+            ],
+            "source": "https://api.worldbank.org/v2/country/IN/indicator/NY.GDP.MKTP.CD",
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        assert "GDP (current US$)" in str(raw)
+        return "India's GDP was steady at ~3.5-3.8 in recent years."
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.economics_tool.fetch_world_bank_indicator", fake_fetch
+    )
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        await add_message(sid, "USER", "TOOL", {"type": "questionnaire_start", "content": TEST_IDEA})
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire", "content": "q", "questions": [{"key": "q1", "question": "who?"}], "facts": {"business_about": TEST_IDEA}},
+        )
+        await add_message(
+            sid, "USER", "TOOL",
+            {"type": "questionnaire_answer", "content": "1) people", "answers": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": "India's GDP growth"}, graph
+            )
+            events = await _collect(ps, 3)
+
+            assert result["messages"][-2]["type"] == "economics_request"
+            assert result["messages"][-1]["type"] == "economics"
+            assert result["messages"][-1]["content"] == (
+                "India's GDP was steady at ~3.5-3.8 in recent years."
+            )
+            assert result["messages"][-1]["data"]["observations"][-1]["year"] == 2024
+            assert result["messages"][-1]["source"].startswith(
+                "https://api.worldbank.org"
+            )
+
+            assert events[0]["type"] == "economics"
+            assert events[0]["content"] == (
+                "India's GDP was steady at ~3.5-3.8 in recent years."
+            )
+            assert events[1]["type"] == "suggestions"
+            assert events[2]["type"] == "end"
+
+            msgs = await db.message.find_many(where={"sessionId": sid})
+            assert [m.agent for m in msgs].count("TOOL") == 6
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_economics_gated_until_questionnaire_complete(monkeypatch):
+    """The economics tool (requires_context=True) must NOT run until the
+    questionnaire is completed — the router redirects to the questionnaire."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "economics"}
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [{"key": "q1", "question": "Who is your target customer?"}],
+        }
+
+    async def fake_econ_run(self, state):
+        raise AssertionError("economics must not run before the questionnaire is completed")
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "run", fake_econ_run)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        request = "India's GDP growth"
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": request}, graph
+            )
+            await _collect(ps, 3)
+
+            types = [m["type"] for m in result["messages"]]
+            assert "economics" not in types
+            assert "economics_request" not in types
+            assert types == ["questionnaire_start", "questionnaire"]
+            assert questionnaire_pending(result["messages"])
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_economics_tool_includes_history_and_data(monkeypatch):
+    """The economics tool passes the business context, the conversation
+    transcript, and the raw API data into the LLM prompts."""
+    captured = {}
+
+    async def fake_plan(self, request, context, transcript):
+        captured["plan"] = {
+            "request": request,
+            "context": context,
+            "transcript": transcript,
+        }
+        return {
+            "operation": "exchange_rate_series",
+            "args": {"base_currency": "INR", "quote_currencies": ["USD"], "group": "month"},
+        }
+
+    async def fake_fetch(base_currency, quote_currencies, start_date, end_date, group):
+        return {
+            "base_currency": "INR",
+            "quote_currencies": ["USD"],
+            "rates": [{"date": "2026-08-01", "base": "INR", "quote": "USD", "rate": 0.012}],
+            "source": "https://api.frankfurter.dev/v2/rates",
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        captured["summarize"] = {"request": request, "raw": raw}
+        return "The INR has been around 0.012 USD."
+
+    tool = EconomicsTool()
+    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.economics_tool.fetch_exchange_rate_series", fake_fetch
+    )
+
+    async def scenario():
+        entries = await tool.run(
+            {
+                "session_id": "s",
+                "user_input": "How has the INR to USD rate moved?",
+                "messages": [
+                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to import goods from the US."},
+                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "importing goods"}},
+                ],
+            }
+        )
+        assert entries[0]["type"] == "economics_request"
+        assert entries[1]["type"] == "economics"
+        assert entries[1]["content"] == "The INR has been around 0.012 USD."
+        assert entries[1]["source"] == "https://api.frankfurter.dev/v2/rates"
+
+        # The business context and transcript reached the plan prompt.
+        assert captured["plan"]["context"]["business_about"] == "importing goods"
+        assert "I plan to import goods from the US." in captured["plan"]["transcript"]
+        # The raw API data reached the summary prompt.
+        assert captured["summarize"]["raw"]["rates"][0]["rate"] == 0.012
+
+    _run(scenario())
+
+
+def test_foresight_tool_routes_and_streams(monkeypatch):
+    """The foresight tool plans a scenario matrix, validates it, summarizes,
+    persists both entries, and streams the result card."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "foresight"}
+
+    async def fake_plan(self, request, context, transcript):
+        return {
+            "operation": "future_signpost_matrix",
+            "args": {
+                "scenarios": [
+                    {
+                        "name": "Steady growth",
+                        "description": "Demand grows steadily",
+                        "probability": 0.6,
+                        "signals": ["repeat orders up"],
+                        "impacts": ["revenue +20%"],
+                        "trigger_actions": ["hire more staff"],
+                    },
+                    {
+                        "name": "Recession",
+                        "description": "Market contracts",
+                        "probability": 0.4,
+                        "signals": ["orders down"],
+                        "impacts": ["revenue -10%"],
+                        "trigger_actions": ["cut costs"],
+                    },
+                ]
+            },
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        assert raw["probability_total"] == 1.0
+        return "Two scenarios ahead: steady growth (60%) or a downturn (40%)."
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(ForesightTool, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightTool, "_summarize", fake_summarize)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        await add_message(sid, "USER", "TOOL", {"type": "questionnaire_start", "content": TEST_IDEA})
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire", "content": "q", "questions": [{"key": "q1", "question": "who?"}], "facts": {"business_about": TEST_IDEA}},
+        )
+        await add_message(
+            sid, "USER", "TOOL",
+            {"type": "questionnaire_answer", "content": "1) people", "answers": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
+        )
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": "scenarios for the next 2 years"}, graph
+            )
+            events = await _collect(ps, 3)
+
+            assert result["messages"][-2]["type"] == "foresight_request"
+            assert result["messages"][-1]["type"] == "foresight"
+            assert len(result["messages"][-1]["data"]["scenarios"]) == 2
+            assert result["messages"][-1]["data"]["probabilities_sum_to_one"] is True
+            assert result["messages"][-1]["data"]["guidance"] == (
+                "Use probabilities as planning judgments, not claims of certainty."
+            )
+
+            assert events[0]["type"] == "foresight"
+            assert events[1]["type"] == "suggestions"
+            assert events[2]["type"] == "end"
+
+            msgs = await db.message.find_many(where={"sessionId": sid})
+            assert [m.agent for m in msgs].count("TOOL") == 6
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_foresight_gated_until_questionnaire_complete(monkeypatch):
+    """The foresight tool (requires_context=True) must NOT run until the
+    questionnaire is completed — the router redirects to the questionnaire."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "foresight"}
+
+    async def fake_is_real_idea(self, idea):
+        return True
+
+    async def fake_plan(self, idea):
+        return {
+            "facts": {"business_about": idea},
+            "questions": [{"key": "q1", "question": "Who is your target customer?"}],
+        }
+
+    async def fake_foresight_run(self, state):
+        raise AssertionError("foresight must not run before the questionnaire is completed")
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightTool, "run", fake_foresight_run)
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        request = "What are the possible futures for my business?"
+        try:
+            result = await process_job(
+                {"session_id": sid, "user_input": request}, graph
+            )
+            await _collect(ps, 3)
+
+            types = [m["type"] for m in result["messages"]]
+            assert "foresight" not in types
+            assert "foresight_request" not in types
+            assert types == ["questionnaire_start", "questionnaire"]
+            assert questionnaire_pending(result["messages"])
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_future_signpost_matrix_validates():
+    """Probabilities outside [0,1] raise ValueError; valid scenarios are
+    normalized and the sum-to-one flag is reported."""
+    result = future_signpost_matrix(
+        [
+            {"name": "A", "probability": 0.6, "signals": ["x"], "impacts": ["y"], "trigger_actions": ["z"]},
+            {"name": "B", "probability": 0.4},
+        ]
+    )
+    assert len(result["scenarios"]) == 2
+    assert result["probability_total"] == 1.0
+    assert result["probabilities_sum_to_one"] is True
+    assert result["scenarios"][0]["signals"] == ["x"]
+
+    with pytest.raises(ValueError):
+        future_signpost_matrix([{"name": "bad", "probability": 1.5}])
+
+
+def test_foresight_tool_includes_history_and_data(monkeypatch):
+    """The foresight tool passes the business context, the conversation
+    transcript, and the raw analysis into the LLM prompts, and includes the
+    JPL disclaimer for astronomical requests."""
+    captured = {}
+
+    async def fake_plan(self, request, context, transcript):
+        captured["plan"] = {
+            "request": request,
+            "context": context,
+            "transcript": transcript,
+        }
+        return {
+            "operation": "jpl_horizons_ephemeris",
+            "args": {
+                "target": "Mars",
+                "start_time": "2026-08-01",
+                "stop_time": "2026-08-03",
+            },
+        }
+
+    async def fake_fetch(target, start_time, stop_time, step_size, center):
+        return {
+            "target": target,
+            "start_time": start_time,
+            "stop_time": stop_time,
+            "ephemeris": "$$\nSOE\n2026-Aug-01  ...",
+            "source": "https://ssd.jpl.nasa.gov/api/horizons.api",
+            "disclaimer": (
+                "Astronomical data is scientific; astrological interpretation is "
+                "non-scientific and must not drive high-stakes decisions."
+            ),
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        captured["summarize"] = {"request": request, "raw": raw}
+        return "Here are Mars' observable positions; this is not a prediction."
+
+    tool = ForesightTool()
+    monkeypatch.setattr(ForesightTool, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.foresight_tool.fetch_jpl_horizons_ephemeris", fake_fetch
+    )
+
+    async def scenario():
+        entries = await tool.run(
+            {
+                "session_id": "s",
+                "user_input": "Where is Mars this week?",
+                "messages": [
+                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to open a bakery in Pune."},
+                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "a bakery in Pune"}},
+                ],
+            }
+        )
+        assert entries[0]["type"] == "foresight_request"
+        assert entries[1]["type"] == "foresight"
+        assert entries[1]["content"] == "Here are Mars' observable positions; this is not a prediction."
+        assert entries[1]["source"] == "https://ssd.jpl.nasa.gov/api/horizons.api"
+        assert "Astronomical data is scientific" in entries[1]["data"]["disclaimer"]
+
+        assert captured["plan"]["context"]["business_about"] == "a bakery in Pune"
+        assert "I plan to open a bakery in Pune." in captured["plan"]["transcript"]
+        assert captured["summarize"]["raw"]["target"] == "Mars"
+
+    _run(scenario())
+
+
+def test_http_cache_key_is_stable_and_unique():
+    """Cache keys ignore header/method casing and parameter order but change
+    when any part of the request differs."""
+    from worker.helpers import http_cache
+
+    k1 = http_cache._cache_key(
+        "GET", "https://api.test/data", {"a": 1, "b": 2}, None, None
+    )
+    k2 = http_cache._cache_key(
+        "get", "https://api.test/data", {"b": 2, "a": 1}, None, None
+    )
+    k3 = http_cache._cache_key(
+        "POST", "https://api.test/data", {"a": 1, "b": 2}, None, None
+    )
+    k4 = http_cache._cache_key(
+        "GET", "https://api.test/data", {"a": 1}, None, None
+    )
+    k5 = http_cache._cache_key(
+        "GET", "https://api.test/data", {"a": 1, "b": 2}, {"X-Token": "t"}, None
+    )
+    assert len(k1) == 64
+    assert k1 == k2
+    assert k1 != k3
+    assert k1 != k4
+    assert k1 != k5
+    assert http_cache._redis_key(k1).startswith(f"{http_cache.TOOL_CACHE_NAMESPACE}:")
+
+
+def test_cached_json_caches_payload_in_redis(monkeypatch):
+    """A second identical call must be served from the Redis TTL cache without
+    re-fetching the remote endpoint."""
+    from worker.helpers import http_cache
+
+    url = "https://api.test/indicator"
+    key = http_cache._redis_key(http_cache._cache_key("GET", url, None, None, None))
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def request(self, method, url_, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+                json=lambda: {"indicator": "GDP", "value": 3.5},
+            )
+
+    client = FakeClient()
+    monkeypatch.setattr(http_cache, "_client", client)
+
+    async def scenario():
+        await redis.delete(key)
+        try:
+            first = await http_cache.cached_json("GET", url, ttl_seconds=60)
+            second = await http_cache.cached_json("GET", url, ttl_seconds=60)
+            stored = await redis.get(key)
+            ttl = await redis.ttl(key)
+            assert first == {"indicator": "GDP", "value": 3.5}
+            assert second == first
+            assert client.calls == 1
+            assert json.loads(stored) == {"indicator": "GDP", "value": 3.5}
+            assert 0 < ttl <= 60
+        finally:
+            await redis.delete(key)
+
+    _run(scenario())
+
+
+def test_cached_json_retries_transient_statuses(monkeypatch):
+    """Transient statuses (429/502/503/504) are retried with backoff before a
+    successful response is returned and cached."""
+    from worker.helpers import http_cache
+
+    url = "https://api.test/flaky"
+    key = http_cache._redis_key(http_cache._cache_key("GET", url, None, None, None))
+    attempts = {"n": 0}
+
+    class FlakyClient:
+        async def request(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                return SimpleNamespace(
+                    status_code=503,
+                    headers={},
+                    raise_for_status=lambda: None,
+                    json=lambda: {},
+                )
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+                json=lambda: {"ok": True},
+            )
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(http_cache, "_client", FlakyClient())
+    monkeypatch.setattr(http_cache.asyncio, "sleep", noop)
+
+    async def scenario():
+        await redis.delete(key)
+        try:
+            payload = await http_cache.cached_json("GET", url, ttl_seconds=30)
+            assert payload == {"ok": True}
+            assert attempts["n"] == 3
+        finally:
+            await redis.delete(key)
+
+    _run(scenario())
+
+
+def test_prompts_route_general_questions_to_tools_not_business_only():
+    """The router prompt must send factual/data questions to the matching tool
+    (economics for World Bank/GDP data) instead of treating them as chat, and
+    the chat prompt must answer general questions instead of declining them."""
+    from worker.prompts.chat import CHAT_PROMPT
+    from worker.prompts.router import ROUTER_PROMPT
+
+    assert "World Bank indicators or country profiles" in ROUTER_PROMPT
+    assert '-> "economics"' in ROUTER_PROMPT
+    assert '-> "foresight"' in ROUTER_PROMPT
+    assert "Keep the conversation on business topics" not in ROUTER_PROMPT
+    assert "ONLY talk about business" not in CHAT_PROMPT
+    assert "general knowledge" in CHAT_PROMPT
+
+
+def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
+    """With the questionnaire completed, a World Bank country-profile question is
+    answered by the economics tool (from World Bank data) instead of being
+    declined as non-business."""
+    async def fake_classify(self, user_input, messages, tools):
+        return {"intent": "tool", "tool": "economics"}
+
+    async def fake_plan(self, request, context, transcript):
+        return {
+            "operation": "world_bank_country_profile",
+            "args": {"country_code": "IN"},
+        }
+
+    async def fake_fetch(country_code):
+        return {
+            "country_code": "IN",
+            "country": "India",
+            "region": "South Asia",
+            "income_level": "Lower middle income",
+            "lending_type": "IBRD",
+            "capital": "New Delhi",
+            "longitude": "77.2",
+            "latitude": "28.6",
+            "source": "https://api.worldbank.org/v2/country/IN",
+        }
+
+    async def fake_summarize(self, request, context, transcript, raw):
+        assert raw["country"] == "India"
+        return "India is a Lower middle income economy in South Asia with capital New Delhi."
+
+    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(
+        "worker.tools.economics_tool.fetch_world_bank_country_profile", fake_fetch
+    )
+
+    async def scenario():
+        session = await _make_session()
+        sid = session.id
+        await add_message(
+            sid, "ASSISTANT", "TOOL",
+            {"type": "questionnaire_complete", "content": "done",
+             "context": {"business_about": TEST_IDEA}},
+        )
+        graph = build_graph()
+        ps = await _subscribe(sid)
+        try:
+            result = await process_job(
+                {
+                    "session_id": sid,
+                    "user_input": "can you give me world bank country profile for india",
+                },
+                graph,
+            )
+            await _collect(ps, 3)
+
+            assert result["messages"][-2]["type"] == "economics_request"
+            assert result["messages"][-1]["type"] == "economics"
+            assert result["messages"][-1]["content"] == (
+                "India is a Lower middle income economy in South Asia with capital New Delhi."
+            )
+            assert result["messages"][-1]["data"]["income_level"] == "Lower middle income"
+            assert result["messages"][-1]["source"].startswith(
+                "https://api.worldbank.org"
+            )
+
+            await ps.unsubscribe(f"stream:{sid}")
+            await ps.close()
+        finally:
+            await _cleanup(sid)
+
+    _run(scenario())
+
+
+def test_fetch_world_bank_indicator_parses_and_sorts(monkeypatch):
+    """World Bank indicator responses are parsed into sorted observations and
+    country codes are uppercased."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        assert "per_page" in kwargs["params"]
+        return [
+            {"page": 1},
+            [
+                {
+                    "date": "2020",
+                    "value": 5.0,
+                    "country": {"value": "India"},
+                    "unit": "",
+                    "obs_status": None,
+                    "indicator": {"value": "GDP (current US$)"},
+                },
+                {
+                    "date": "2019",
+                    "value": 4.0,
+                    "country": {"value": "India"},
+                    "unit": "",
+                    "obs_status": None,
+                    "indicator": {"value": "GDP (current US$)"},
+                },
+            ],
+        ]
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_world_bank_indicator(
+            "in", "NY.GDP.MKTP.CD", start_year=2019, end_year=2020
+        )
+        assert result["country_code"] == "IN"
+        assert [o["year"] for o in result["observations"]] == [2019, 2020]
+        assert result["indicator"] == "GDP (current US$)"
+
+    _run(scenario())
+
+
+def test_fetch_world_bank_indicator_handles_empty_payload(monkeypatch):
+    """Non-list or short payloads produce an empty observations list instead of
+    an error."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"not": "a list"}
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_world_bank_indicator(
+            "IN", "NY.GDP.MKTP.CD"
+        )
+        assert result["observations"] == []
+
+    _run(scenario())
+
+
+def test_fetch_world_bank_indicator_rejects_invalid_range():
+    """start_year after end_year is rejected before any network call."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="start_year"):
+        class _T:
+            pass
+
+        # avoid coroutine: call the wrapper through a captured event loop
+        async def _scenario():
+            from worker.tools import economics_tool
+
+            await economics_tool.fetch_world_bank_indicator(
+                "IN", "X", start_year=2024, end_year=2020
+            )
+
+        _run(_scenario())
+
+
+def test_fetch_world_bank_country_profile_empty(monkeypatch):
+    """An empty country list yields a None country rather than an error."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return [{"page": 1}, []]
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_world_bank_country_profile("XX")
+        assert result["country"] is None
+        assert result["country_code"] == "XX"
+
+    _run(scenario())
+
+
+def test_fetch_bls_time_series_parses_values(monkeypatch):
+    """BLS series parse float values and keep the raw value, sorting by date."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        assert kwargs["json_body"] == {"seriesid": ["CUUR0000SA0"]}
+        return {
+            "status": "REQUEST_SUCCEEDED",
+            "Results": {
+                "series": [
+                    {
+                        "seriesID": "CUUR0000SA0",
+                        "data": [
+                            {
+                                "year": "2024",
+                                "period": "M01",
+                                "periodName": "January",
+                                "value": "308.417",
+                                "footnotes": [{"text": "note1"}],
+                            },
+                            {"year": "2023", "period": "M12", "periodName": "December", "value": "n/a", "footnotes": []},
+                        ],
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_bls_time_series(["CUUR0000SA0"])
+        assert result["status"] == "REQUEST_SUCCEEDED"
+        assert result["series"][0]["series_id"] == "CUUR0000SA0"
+        obs = result["series"][0]["observations"]
+        by_year = {o["year"]: o for o in obs}
+        assert by_year[2023]["value"] is None  # "n/a" → None
+        assert by_year[2024]["value"] == 308.417
+        assert by_year[2024]["footnotes"] == ["note1"]
+
+    _run(scenario())
+
+
+def test_fetch_bls_time_series_handles_failed_status(monkeypatch):
+    """A non-REQUEST_SUCCEEDED response surfaces the API status and messages."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"status": "REQUEST_FAILED", "message": ["No data"]}
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await economics_tool.fetch_bls_time_series(["XXX"])
+        assert result["status"] == "REQUEST_FAILED"
+        assert result["messages"] == ["No data"]
+        assert result["series"] == []
+
+    _run(scenario())
+
+
+def test_fetch_bls_time_series_validates_series_count(monkeypatch):
+    """BLS accepts between 1 and 20 series IDs."""
+    from worker.tools import economics_tool
+
+    async def scenario():
+        with pytest.raises(ValueError, match="between 1 and 20"):
+            await economics_tool.fetch_bls_time_series([])
+
+    _run(scenario())
+
+
+def test_fetch_exchange_rate_series_validates_args(monkeypatch):
+    """Quote currencies are required and the group must be week/month."""
+    from worker.tools import economics_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"base": "USD", "rates": []}
+
+    monkeypatch.setattr(economics_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        with pytest.raises(ValueError, match="quote currency"):
+            await economics_tool.fetch_exchange_rate_series("USD", [])
+        with pytest.raises(ValueError, match="group"):
+            await economics_tool.fetch_exchange_rate_series(
+                "usd", ["inr"], group="year"
+            )
+        result = await economics_tool.fetch_exchange_rate_series(
+            "usd", ["inr", "EUR"], group="month"
+        )
+        assert result["base_currency"] == "USD"
+        assert result["quote_currencies"] == ["INR", "EUR"]
+
+    _run(scenario())
+
+
+def test_economics_trim_limits_data():
+    """_trim caps observation lists so persisted messages stay small."""
+    from worker.tools.economics_tool import MAX_OBSERVATIONS, _trim
+
+    rows = [{"year": i, "value": i} for i in range(50)]
+    trimmed = _trim({"observations": rows, "series": [{"observations": rows}]})
+    assert len(trimmed["observations"]) == MAX_OBSERVATIONS
+    assert len(trimmed["observations"][-1].keys()) >= 2
+    assert trimmed["series"][0]["observations"] == trimmed["observations"]
+    # Non-list fields are left untouched.
+    assert _trim({"foo": "bar"}) == {"foo": "bar"}
+
+
+def test_economics_dispatch_rejects_unknown_operation(monkeypatch):
+    """An unrecognized operation bubbles up as a ValueError."""
+    from worker.tools import economics_tool
+
+    tool = economics_tool.EconomicsTool()
+    monkeypatch.setattr(economics_tool.EconomicsTool, "_plan", None)
+
+    async def scenario():
+        with pytest.raises(ValueError, match="Unknown economics operation"):
+            await tool._dispatch("not_a_real_op", {})
+
+    _run(scenario())
+
+
+def test_foresight_dispatch_validates_scenario_plan(monkeypatch):
+    """Scenario planning requires at least one valid scenario dict."""
+    from worker.tools import foresight_tool
+
+    tool = foresight_tool.ForesightTool()
+
+    async def scenario():
+        with pytest.raises(ValueError, match="at least one scenario"):
+            await tool._dispatch("future_signpost_matrix", {"scenarios": []})
+        with pytest.raises(ValueError, match="at least one scenario"):
+            await tool._dispatch("future_signpost_matrix", {"scenarios": [1, 2]})
+        with pytest.raises(ValueError, match="Unknown foresight operation"):
+            await tool._dispatch("nope", {})
+        result = await tool._dispatch(
+            "future_signpost_matrix",
+            {"scenarios": [{"name": "A", "probability": 0.5}]},
+        )
+        assert result["scenarios"][0]["name"] == "A"
+
+    _run(scenario())
+
+
+def test_fetch_jpl_ephemeris_truncates_output(monkeypatch):
+    """JPL responses are truncated to the trailing 20k chars so messages stay
+    small."""
+    from worker.tools import foresight_tool
+
+    async def fake_cached_json(method, url, **kwargs):
+        return {"result": "x" * 50000}
+
+    monkeypatch.setattr(foresight_tool, "cached_json", fake_cached_json)
+
+    async def scenario():
+        result = await foresight_tool.fetch_jpl_horizons_ephemeris(
+            "Mars", "2026-08-01", "2026-08-03"
+        )
+        assert len(result["ephemeris"]) == 20000
+        assert result["ephemeris"].endswith("x" * 20000)
+        assert result["disclaimer"]
+
+    _run(scenario())
+
+
+def test_future_signpost_matrix_flags_non_sum_one():
+    """Probabilities that don't sum to one are flagged, and empty scenario lists
+    are rejected."""
+    from worker.tools.foresight_tool import future_signpost_matrix
+
+    result = future_signpost_matrix([{"name": "A", "probability": 0.5}])
+    assert result["probabilities_sum_to_one"] is False
+    assert result["probability_total"] == 0.5
+
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        future_signpost_matrix([{"name": "bad", "probability": -0.1}])
+
+
+def test_cached_json_maps_remote_errors_to_tool_service_error(monkeypatch):
+    """Network failures and non-JSON responses surface as ToolServiceError."""
+    from worker.helpers import http_cache
+
+    import httpx
+
+    url = "https://api.test/broken"
+    key = http_cache._redis_key(http_cache._cache_key("GET", url, None, None, None))
+
+    class TimeoutClient:
+        async def request(self, *args, **kwargs):
+            raise httpx.TimeoutException("timed out")
+
+    class BadJsonClient:
+        async def request(self, *args, **kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+                json=lambda: (_ for _ in ()).throw(ValueError("no json")),
+            )
+
+    class HttpStatusClient:
+        async def request(self, *args, **kwargs):
+            response = SimpleNamespace(
+                status_code=403,
+                headers={},
+                json=lambda: {},
+            )
+            response.raise_for_status = lambda: (_ for _ in ()).throw(
+                httpx.HTTPStatusError("403", request=httpx.Request("GET", url), response=response)
+            )
+            return response
+
+    async def scenario():
+        await redis.delete(key)
+        try:
+            monkeypatch.setattr(http_cache, "_client", TimeoutClient())
+            with pytest.raises(http_cache.ToolServiceError, match="failed"):
+                await http_cache.cached_json("GET", url, ttl_seconds=30)
+
+            monkeypatch.setattr(http_cache, "_client", BadJsonClient())
+            with pytest.raises(http_cache.ToolServiceError, match="failed"):
+                await http_cache.cached_json("GET", url, ttl_seconds=30)
+
+            monkeypatch.setattr(http_cache, "_client", HttpStatusClient())
+            with pytest.raises(http_cache.ToolServiceError, match="failed"):
+                await http_cache.cached_json("GET", url, ttl_seconds=30)
+        finally:
+            await redis.delete(key)
 
     _run(scenario())

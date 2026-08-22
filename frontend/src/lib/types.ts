@@ -135,6 +135,18 @@ export type StreamFrame =
   | { type: 'questionnaire_complete'; content: string; context: Record<string, string> }
   | { type: 'swot'; content: string; sections: SwotSections; summary?: string }
   | { type: 'research'; content: string }
+  | {
+      type: 'economics'
+      content: string
+      data?: Record<string, unknown>
+      source?: string
+    }
+  | {
+      type: 'foresight'
+      content: string
+      data?: Record<string, unknown>
+      source?: string
+    }
   | { type: 'astrology'; content: string; insights: string[]; disclaimer: string }
   | {
       type: 'legal_research'

@@ -135,6 +135,33 @@
 
 .research-card p:last-child { margin-bottom: 0; }
 
+.economics-table { width: 100%; border-collapse: collapse; margin: 10px 0 4px; font-size: 14px; }
+.economics-table th, .economics-table td { border: 1px solid rgba(38, 34, 61, .18); padding: 5px 9px; text-align: left; }
+.economics-table th { background: rgba(255, 147, 111, .12); color: #26223d; font-weight: 600; }
+.economics-table td { color: #4b4557; }
+.economics-card p:last-child { margin-bottom: 0; }
+.economics-source { display: block; margin-top: 8px; font-size: 12px; color: #8f89a8; }
+.economics-source a { color: #b3542f; text-decoration: none; }
+.economics-source a:hover { text-decoration: underline; }
+
+.scenario-matrix { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.scenario-block { border: 1px solid rgba(38, 34, 61, .14); border-radius: 12px; padding: 12px 14px; background: #fff; }
+.scenario-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.scenario-name { font-family: 'Playfair Display', Georgia, serif; font-style: italic; font-weight: 600; font-size: 16px; color: #26223d; }
+.scenario-prob { font-weight: 700; font-size: 14px; color: #b3542f; flex-shrink: 0; }
+.scenario-desc { margin: 0 0 8px; font-size: 14.5px; color: #4b4557; }
+.scenario-list { margin: 4px 0; font-size: 14px; color: #4b4557; }
+.scenario-list-label { font-weight: 600; color: #26223d; }
+.scenario-list ul { margin: 2px 0 0; padding-left: 18px; }
+.scenario-list li { margin: .15em 0; }
+.scenario-sum { margin: 10px 0 0; font-size: 13px; font-weight: 600; color: #5a5266; }
+.scenario-guidance { margin: 4px 0 0; font-size: 12.5px; font-style: italic; color: #8f89a8; }
+.ephemeris-pre { background: #201c31; color: #f0ead9; border-radius: 10px; padding: 12px 14px; overflow-x: auto; margin: 10px 0 8px; font-size: 12px; line-height: 1.45; max-height: 320px; }
+.ephemeris-disclaimer { margin: 0 0 4px; font-size: 12.5px; font-style: italic; color: #8f89a8; }
+.foresight-card p:last-child { margin-bottom: 0; }
+.foresight-source { display: block; margin-top: 8px; font-size: 12px; color: #8f89a8; }
+.foresight-source a { color: #b3542f; text-decoration: none; }
+.foresight-source a:hover { text-decoration: underline; }
 .astrology-card .markdown { margin-bottom: 2px; }
 .astrology-disclaimer { margin-top: 12px; padding-top: 9px; border-top: 1px dashed rgba(38, 34, 61, .18); font-size: 12.5px; line-height: 1.5; color: #8f89a8; }
 

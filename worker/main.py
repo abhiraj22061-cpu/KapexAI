@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import signal
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,8 +29,14 @@ async def main() -> None:
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    if sys.platform == "win32":
+        # loop.add_signal_handler is not supported on Windows — fall back to the
+        # classic signal.signal, which only works from the main thread (it does).
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
 
     graph = build_graph()
     logger.info("Worker started. Listening on %s ...", JOB_QUEUE)
