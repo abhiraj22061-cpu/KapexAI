@@ -1,5 +1,8 @@
 import type { ComponentType } from 'react'
 import { AstrologyCard } from './AstrologyCard'
+import { CaseSearchCard } from './CaseSearchCard'
+import { IssueRegisterCard } from './IssueRegisterCard'
+import { LegalResearchCard } from './LegalResearchCard'
 import { IndianFinanceCard } from './IndianFinanceCard'
 import { MarkdownMessage } from './MarkdownMessage'
 import { QuestionnaireCard } from './QuestionnaireCard'
@@ -28,6 +31,9 @@ const registry: Record<string, ComponentType<MessageComponentProps>> = {
   swot: SwotCard,
   research: ResearchCard,
   astrology: AstrologyCard,
+  legal_research: LegalResearchCard,
+  case_search: CaseSearchCard,
+  issue_register: IssueRegisterCard,
   indian_finance: IndianFinanceCard,
 }
 

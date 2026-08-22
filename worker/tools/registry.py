@@ -1,5 +1,10 @@
 from worker.tools.astrology_tool import AstrologyTool
 from worker.tools.base import Tool
+from worker.tools.legal_tools import (
+    IndianCaseSearchTool,
+    IndianLegalSearchTool,
+    LegalIssueRegisterTool,
+)
 from worker.tools.finance_tool import FinanceTool
 from worker.tools.indian_finance_tool import IndianFinanceTool
 from worker.tools.questionnaire_tool import QuestionnaireTool
@@ -18,6 +23,9 @@ register(SwotTool())
 register(WebSearchTool())
 register(FinanceTool())
 register(AstrologyTool())
+register(IndianLegalSearchTool())
+register(IndianCaseSearchTool())
+register(LegalIssueRegisterTool())
 register(IndianFinanceTool())
 
 
