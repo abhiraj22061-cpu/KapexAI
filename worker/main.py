@@ -58,6 +58,7 @@ async def main() -> None:
             await process_job(job, graph)
         except Exception:
             logger.exception("Failed to process job: %s", raw)
+        await asyncio.sleep(1)
 
     await disconnect_redis()
     await disconnect_db()

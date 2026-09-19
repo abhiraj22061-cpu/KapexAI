@@ -61,7 +61,7 @@ GOOGLE_CLIENT_SECRET="your-google-client-secret"
 GOOGLE_REDIRECT_URI="https://your-backend-domain.com/auth/google/callback"
 
 # LLM / Tools
-MISTRAL_API_KEY="your-mistral-api-key"
+GOOGLE_API_KEY="your-google-api-key"
 TAVILY_API_KEY="your-tavily-api-key"
 INDIANKANOON_API_TOKEN="your-indian-kanoon-api-token"
 SEC_USER_AGENT="KapexAI contact@yourdomain.com"
@@ -328,7 +328,7 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
 
   deploy:
@@ -389,7 +389,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           INDIANKANOON_API_TOKEN: ${{ secrets.INDIANKANOON_API_TOKEN }}
 
@@ -425,7 +425,7 @@ Go to your GitHub repo → **Settings** → **Secrets and variables** → **Acti
 | `JWT_SECRET` | Long random string (32+ chars) |
 | `GOOGLE_CLIENT_ID` | Google OAuth client ID |
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
-| `MISTRAL_API_KEY` | Mistral API key |
+| `GOOGLE_API_KEY` | Google Gemini API key |
 | `TAVILY_API_KEY` | Tavily API key |
 | `INDIANKANOON_API_TOKEN` | Indian Kanoon API token (optional) |
 

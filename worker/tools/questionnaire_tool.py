@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_mistralai import ChatMistralAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from worker.helpers.json_utils import parse_json
 from worker.helpers.messages import last_message, questionnaire_pending
@@ -106,7 +106,7 @@ class QuestionnaireTool(Tool):
     suggestion = "Wanna fill in the business questionnaire to give me better context?"
 
     def __init__(self) -> None:
-        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0.1)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
 
     async def run(self, state: dict) -> list[dict]:
         if questionnaire_pending(state["messages"]):
@@ -468,7 +468,7 @@ class QuestionnaireTool(Tool):
 
         Deterministic checks run first and decide the obvious cases with no
         LLM dependency (a business description that simply names the product
-        and place must never be blocked — and must not fail when Mistral is
+        and place must never be blocked — and must not fail when the LLM is
         slow/down or returns malformed JSON). The LLM is retained only for the
         ambiguous middle (short single words), where classifying the intent
         adds value. In that middle path a malformed or failed response accepts

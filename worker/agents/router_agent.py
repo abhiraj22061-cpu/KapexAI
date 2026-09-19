@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_mistralai import ChatMistralAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from worker.helpers.json_utils import parse_json
 from worker.helpers.messages import format_transcript
@@ -14,7 +14,7 @@ from worker.prompts.router import ROUTER_TEMPLATE
 
 class RouterAgent:
     def __init__(self) -> None:
-        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0.1)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
 
     async def classify(
         self, user_input: str, messages: list[dict], tools: list[dict]

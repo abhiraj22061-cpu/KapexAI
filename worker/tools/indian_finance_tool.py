@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from langchain_core.tools import tool
-from langchain_mistralai import ChatMistralAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from worker.helpers.json_utils import parse_json
 from worker.helpers.messages import business_context, format_transcript
@@ -591,7 +591,7 @@ class IndianFinanceTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
 
     async def run(self, state: dict) -> list[dict]:
         request = str(state.get("user_input") or "")

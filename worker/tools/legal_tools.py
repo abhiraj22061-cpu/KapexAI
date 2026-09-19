@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_mistralai import ChatMistralAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from worker.helpers.cached_http import (
     ToolConfigurationError,
@@ -116,7 +116,7 @@ class IndianLegalSearchTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0.2)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
 
     async def run(self, state: dict) -> list[dict]:
         request = str(state.get("user_input") or "")
@@ -224,7 +224,7 @@ class IndianCaseSearchTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0.2)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
 
     async def run(self, state: dict) -> list[dict]:
         request = str(state.get("user_input") or "")
@@ -289,7 +289,7 @@ class LegalIssueRegisterTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatMistralAI(model="mistral-small-2506", temperature=0.2)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
 
     async def run(self, state: dict) -> list[dict]:
         request = str(state.get("user_input") or "")

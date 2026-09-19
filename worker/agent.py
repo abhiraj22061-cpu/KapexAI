@@ -4,6 +4,8 @@ import json
 import logging
 from typing import TypedDict
 
+import httpx
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from redis_service import redis
@@ -217,8 +219,23 @@ async def process_job(job: dict, graph: CompiledStateGraph) -> State:
         await redis.delete(PENDING_KEY.format(session_id=session_id))
         await mark_session_active(session_id)
         return result
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to process session %s (job %s)", session_id, job_id)
+
+        rate_limited = False
+        err = exc
+        while err is not None:
+            if isinstance(err, httpx.HTTPStatusError) and err.response.status_code == 429:
+                rate_limited = True
+                break
+            err = err.__cause__ or err.__context__
+
+        error_content = (
+            "Oops, looks like Kapex has hit its API limit. Please try again in a minute."
+            if rate_limited
+            else (f"Job {job_id} failed" if job_id else "Job failed")
+        )
+
         try:
             await mark_session_failed(session_id)
             await redis.delete(PENDING_KEY.format(session_id=session_id))
@@ -227,7 +244,7 @@ async def process_job(job: dict, graph: CompiledStateGraph) -> State:
                 {
                     "type": "error",
                     "job_id": job_id,
-                    "content": f"Job {job_id} failed" if job_id else "Job failed",
+                    "content": error_content,
                 },
             )
         except Exception:
