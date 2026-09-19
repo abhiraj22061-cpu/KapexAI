@@ -7,6 +7,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from worker.helpers.json_utils import extract_text
 from worker.prompts.chat import CHAT_TEMPLATE
 
 
@@ -30,4 +31,4 @@ class ChatAgent:
                 "tools": json.dumps([t["name"] for t in tools], indent=2),
             }
         )
-        return response.content
+        return extract_text(response.content)

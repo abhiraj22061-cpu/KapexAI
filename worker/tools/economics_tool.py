@@ -10,7 +10,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from worker.helpers.http_cache import cached_json
-from worker.helpers.json_utils import parse_json
+from worker.helpers.json_utils import extract_text, parse_json
 from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.economics import (
     ECONOMICS_PLAN_TEMPLATE,
@@ -260,7 +260,7 @@ class EconomicsTool(Tool):
                 "data": json.dumps(raw, indent=2),
             }
         )
-        return str(response.content or "").strip()
+        return extract_text(response.content).strip()
 
     async def _dispatch(self, operation: str, args: dict) -> dict:
         if operation == "world_bank_indicator":

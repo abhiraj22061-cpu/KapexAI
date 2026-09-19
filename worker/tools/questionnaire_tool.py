@@ -8,7 +8,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from worker.helpers.json_utils import parse_json
+from worker.helpers.json_utils import extract_text, parse_json
 from worker.helpers.messages import last_message, questionnaire_pending
 from worker.helpers.persistence import update_session_business_idea
 from worker.prompts.questionnaire import (
@@ -347,7 +347,7 @@ class QuestionnaireTool(Tool):
                 ),
             }
         )
-        explanation = str(response.content or "").strip()
+        explanation = extract_text(response.content).strip()
         if not explanation:
             return self._reask(questions, facts, user_text)
         return [
