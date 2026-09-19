@@ -106,7 +106,7 @@ class QuestionnaireTool(Tool):
     suggestion = "Wanna fill in the business questionnaire to give me better context?"
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
 
     async def run(self, state: dict) -> list[dict]:
         if questionnaire_pending(state["messages"]):

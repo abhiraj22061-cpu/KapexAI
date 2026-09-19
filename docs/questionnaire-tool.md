@@ -406,7 +406,7 @@ request can never be misclassified as a bad answer.
 
 ## 8. The seven LLM calls (the "brains")
 
-All use the same model (`gemini-2.0-flash`, `temperature=0.1`) and are
+All use the same model (`gemini-3.6-flash`, `temperature=0.1`) and are
 just a prompt template piped into the model. The prompts live in
 `worker/prompts/questionnaire.py`.
 

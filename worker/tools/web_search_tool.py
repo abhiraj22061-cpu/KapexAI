@@ -23,7 +23,7 @@ class WebSearchTool(Tool):
     requires_context = True
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
         # The system prompt is built per request (with the business context and
         # message history), so the agent is created without a static prompt.
         self.agent = create_react_agent(self.llm, [tavily_search])

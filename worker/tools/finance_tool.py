@@ -66,7 +66,7 @@ class FinanceTool(Tool):
         # once here and reused across every run() call. The system prompt is
         # built per request (with the business context and message history), so
         # the agent is created without a static prompt.
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
         self.agent = create_react_agent(
             self.llm,
             [

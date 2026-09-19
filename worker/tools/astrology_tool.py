@@ -25,7 +25,7 @@ class AstrologyTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.4)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.4)
 
     async def run(self, state: dict) -> list[dict]:
         request = str(state.get("user_input") or "")
