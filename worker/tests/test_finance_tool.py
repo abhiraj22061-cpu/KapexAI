@@ -4,17 +4,19 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 
-from worker.tools.base import Tool
+from worker.agents.base import SubAgent as Tool
 from worker.tools.equity_calculators import EQUITY_CALCULATOR_TOOLS
 from worker.tools.finance_calculators import FINANCE_CALCULATOR_TOOLS
-from worker.tools.finance_tool import FINANCE_SYSTEM_PROMPT, FinanceTool
+from worker.agents.finance_agent import FINANCE_SYSTEM_PROMPT, FinanceAgent
 from worker.tools.finance_tools import (
     FINANCE_TOOLS,
     FinanceToolError,
     cached_json,
     require_env,
 )
-from worker.tools.registry import _REGISTRY, get_tool, list_tools
+from worker.agents.registry import _REGISTRY, get_subagent as get_tool, list_subagents as list_tools
+from conftest import make_ctx
+from worker.orchestrator.composer import assistant_card
 
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
@@ -44,7 +46,7 @@ def test_registry_exposes_only_finance():
 
 def test_finance_tool_is_a_tool():
     tool = get_tool("finance")
-    assert isinstance(tool, FinanceTool)
+    assert isinstance(tool, FinanceAgent)
     assert isinstance(tool, Tool)
     assert tool.name == "finance"
     assert not tool.requires_context
@@ -53,7 +55,7 @@ def test_finance_tool_is_a_tool():
 def test_finance_agent_binds_all_underlying_tools():
     """The internal react agent holds the 109 tools (so the LLM can call them),
     but they stay out of the main registry."""
-    tool = FinanceTool()
+    tool = FinanceAgent()
     bound = tool.agent.nodes["tools"].bound
     bound_names = set(bound.tools_by_name)
     assert len(bound_names) == 109
@@ -85,7 +87,7 @@ class _FakeModel(Runnable):
 def _agent_with(fake_model: _FakeModel):
     from langgraph.prebuilt import create_react_agent
 
-    tool = FinanceTool()
+    tool = FinanceAgent()
     tool.agent = create_react_agent(
         fake_model,
         [*FINANCE_CALCULATOR_TOOLS, *EQUITY_CALCULATOR_TOOLS, *FINANCE_TOOLS],
@@ -117,22 +119,11 @@ def test_finance_routes_to_finance_calculator(monkeypatch):
     )
     tool = _agent_with(fake)
 
-    entries = tool.run(
-        {
-            "session_id": "s",
-            "user_input": "What is the CAGR from 1000 to 2000 over 4 years?",
-            "messages": [],
-        }
-    )
-    assert entries[0] == {
-        "role": "USER",
-        "agent": "TOOL",
-        "type": "finance_request",
-        "content": "What is the CAGR from 1000 to 2000 over 4 years?",
-    }
-    assert entries[1]["role"] == "ASSISTANT"
-    assert entries[1]["agent"] == "TOOL"
-    assert entries[1]["type"] == "finance"
+    request = "What is the CAGR from 1000 to 2000 over 4 years?"
+    msg = assistant_card(tool.run(request, make_ctx(request, [])))
+    assert msg["role"] == "ASSISTANT"
+    assert msg["agent"] == "TOOL"
+    assert msg["type"] == "finance"
     assert captured["args"] == {
         "beginning_value": 1000,
         "ending_value": 2000,
@@ -168,14 +159,9 @@ def test_finance_routes_to_equity_calculator(monkeypatch):
     )
     tool = _agent_with(fake)
 
-    entries = tool.run(
-        {
-            "session_id": "s",
-            "user_input": "CAPM for beta 1.2, risk free 3%, market return 10%?",
-            "messages": [],
-        }
-    )
-    assert entries[1]["type"] == "finance"
+    request = "CAPM for beta 1.2, risk free 3%, market return 10%?"
+    msg = assistant_card(tool.run(request, make_ctx(request, [])))
+    assert msg["type"] == "finance"
     assert captured["args"] == {
         "risk_free_rate": 0.03,
         "beta": 1.2,
@@ -201,14 +187,9 @@ def test_finance_routes_to_sec_tool(monkeypatch):
     )
     tool = _agent_with(fake)
 
-    entries = tool.run(
-        {
-            "session_id": "s",
-            "user_input": "What is Apple's SEC CIK?",
-            "messages": [],
-        }
-    )
-    assert entries[1]["type"] == "finance"
+    request = "What is Apple's SEC CIK?"
+    msg = assistant_card(tool.run(request, make_ctx(request, [])))
+    assert msg["type"] == "finance"
     assert captured["ticker"] == "AAPL"
 
 
@@ -235,15 +216,10 @@ def test_finance_can_use_multiple_tools():
     )
     tool = _agent_with(fake)
 
-    entries = tool.run(
-        {
-            "session_id": "s",
-            "user_input": "Estimate the beta of these returns then the CAPM cost of equity.",
-            "messages": [],
-        }
-    )
-    assert entries[1]["type"] == "finance"
-    assert "Beta is 1.1" in entries[1]["content"]
+    request = "Estimate the beta of these returns then the CAPM cost of equity."
+    msg = assistant_card(tool.run(request, make_ctx(request, [])))
+    assert msg["type"] == "finance"
+    assert "Beta is 1.1" in msg["content"]
 
 
 def test_finance_system_prompt_prefers_tools():
@@ -300,11 +276,9 @@ def test_finance_run_handles_agent_failure_gracefully():
         def invoke(self, payload):
             raise RuntimeError("agent exploded")
 
-    tool = FinanceTool()
+    tool = FinanceAgent()
     tool.agent = BoomAgent()
-    entries = tool.run(
-        {"session_id": "s", "user_input": "do a calc", "messages": []}
-    )
-    assert entries[0]["type"] == "finance_request"
-    assert entries[1]["type"] == "finance"
-    assert "couldn't complete" in entries[1]["content"].lower()
+    result = tool.run("do a calc", make_ctx("do a calc", []))
+    msg = assistant_card(result)
+    assert msg["type"] == "finance"
+    assert "couldn't complete" in msg["content"].lower()

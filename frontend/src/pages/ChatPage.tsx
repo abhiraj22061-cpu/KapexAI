@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { ChatHeader } from '../components/chat/ChatHeader'
 import { Composer } from '../components/chat/Composer'
 import { MessageList } from '../components/chat/MessageList'
@@ -18,6 +19,29 @@ export function ChatPage() {
   const { blocked, claimTab } = useSingleTab()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const restoredRef = useRef(false)
+
+  // `?session=` restores a conversation on load/refresh (once per mount) —
+  // this is also how "Back to chat" from a dashboard reopens the right chat.
+  useEffect(() => {
+    if (chat.loadingSessions || restoredRef.current) return
+    restoredRef.current = true
+    const sid = searchParams.get('session')
+    if (sid) void chat.selectSession(sid)
+  }, [chat.loadingSessions, searchParams, chat.selectSession])
+
+  // Keep the URL in sync with the active conversation so it stays shareable;
+  // new chats and deletions clear the param instead of restoring the old one.
+  useEffect(() => {
+    if (chat.loadingSessions) return
+    const sid = searchParams.get('session')
+    if (chat.activeSessionId && sid !== chat.activeSessionId) {
+      setSearchParams({ session: chat.activeSessionId }, { replace: true })
+    } else if (!chat.activeSessionId && sid) {
+      setSearchParams({}, { replace: true })
+    }
+  }, [chat.loadingSessions, chat.activeSessionId, searchParams, setSearchParams])
 
   const activeSession = chat.sessions.find((s) => s.id === chat.activeSessionId)
 

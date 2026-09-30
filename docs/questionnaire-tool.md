@@ -1,13 +1,13 @@
 # The Questionnaire Tool — a beginner's guide
 
-This document explains how the **questionnaire tool** works, in plain language,
+This document explains how the **questionnaire agent** works, in plain language,
 so that someone opening the code for the first time can follow along.
 
 **Files you'll touch/read:**
-- `worker/tools/questionnaire_tool.py` — the tool itself (the main file, 197 lines)
+- `worker/agents/questionnaire_agent.py` — the agent itself (the main file)
 - `worker/prompts/questionnaire.py` — the LLM "instructions" (prompt templates)
-- `worker/helpers/messages.py` — the helpers the tool relies on
-- `worker/agent.py` — the graph that decides *when* to run the tool
+- `worker/helpers/messages.py` — the helpers the agent relies on
+- `worker/orchestrator/planner.py` — decides *when* the questionnaire mode runs
 
 If you're new to the agentic pipeline, skim
 [agentic-pipeline.md](agentic-pipeline.md) and
@@ -41,58 +41,60 @@ If either happens, it gently re-asks instead of absorbing the nonsense.
 
 ---
 
-## 2. Where the tool sits in the pipeline
+## 2. Where the agent sits in the pipeline
 
 ```
-User message → router_node → tool_node → QuestionnaireTool.run() → message log + stream
+User message → Orchestrator.handle → Planner.plan → mode "questionnaire"
+              → QuestionnaireAgent.run() → composer persists + streams
 ```
 
-`worker/agent.py` has two nodes:
-
-- **`router_node`** decides *what* to do with the message. If a questionnaire is
-  already waiting for answers, it **always** routes to the questionnaire tool —
-  no LLM call needed:
-
-  ```python
-  # worker/agent.py:52
-  if questionnaire_pending(state["messages"]):
-      return {"intent": "tool", "tool": "questionnaire"}
-  ```
-
-  Otherwise it asks an LLM (`router_agent.classify`) whether the message is
-  small talk (`chat`) or a request for a tool. The router is told that a new
-  business idea — and also "set up / start / build a business" — should be
-  routed to the questionnaire tool, so a user who wants guided setup gets the
-  interview instead of an open-ended "what do you need?". The chat agent also
-  proactively offers the questionnaire when there's no business context yet,
-  rather than repeating "how can I help?".
-
-  Finally there is a **context gate**: any tool with `requires_context = True`
-  (SWOT, web research) is redirected to the questionnaire tool until a
-  `questionnaire_complete` message exists:
-
-  ```python
-  # worker/agent.py:60
-  if tool.requires_context and not questionnaire_complete(state["messages"]):
-      return {"intent": "tool", "tool": "questionnaire"}
-  ```
-
-  So asking for a SWOT before the interview is done doesn't produce a generic
-  SWOT from an empty context — it routes you to the questionnaire to build
-  context first.
-
-- **`tool_node`** looks up the tool by name in `worker/tools/registry.py`,
-  calls its `run()` method, then persists + streams whatever it returns.
-
-The questionnaire tool is registered in `worker/tools/registry.py:13`:
+The **planner** (`worker/orchestrator/planner.py`) decides *what* to do with
+the message. If a questionnaire is already waiting for answers, it **always**
+returns questionnaire mode — no LLM call needed:
 
 ```python
-register(QuestionnaireTool())
+# worker/orchestrator/planner.py
+if questionnaire_pending(messages):
+    return Plan(mode="questionnaire")
 ```
 
-> **How does a tool get picked?** The router sees each tool's `name`,
-> `description` and `example` (see `registry.list_tools()`). The questionnaire
-> tool advertises itself as:
+Otherwise it asks an LLM (one `PLAN_TEMPLATE` call) for a plan. The prompt
+tells it that a new business idea — and also "set up / start / build a
+business" — should be routed to the questionnaire, so a user who wants guided
+setup gets the interview instead of an open-ended "what do you need?". The
+chat agent also proactively offers the questionnaire when there's no business
+context yet, rather than repeating "how can I help?".
+
+Finally there is a **context gate**: any subagent with
+`requires_context = True` (SWOT, web research, economics, foresight) and any
+`dashboard` request are redirected to the questionnaire until a
+`questionnaire_complete` message exists (the planner's deterministic sanitize
+pass does this regardless of what the LLM answered):
+
+```python
+# worker/orchestrator/planner.py (_sanitize)
+if mode == "inline" and self._gated(subagents[0]["name"]) and not ready:
+    return Plan(mode="questionnaire")
+if mode == "dashboard" and not ready:
+    return Plan(mode="questionnaire")
+```
+
+So asking for a SWOT before the interview is done doesn't produce a generic
+SWOT from an empty context — it routes you to the questionnaire to build
+context first.
+
+- The **composer** (`worker/orchestrator/composer.py`) then runs the agent and
+  is the only code that persists entries to the DB and streams them.
+
+The agent is registered in `worker/agents/registry.py`:
+
+```python
+register(QuestionnaireAgent())
+```
+
+> **How does an agent get picked?** The planner sees each agent's `name`,
+> `description` and `example` (see `registry.list_subagents()`). The
+> questionnaire advertises itself as:
 > `example = "Start the business questionnaire"` — that's how the LLM knows a
 > user asking to "start the business questionnaire" should be sent here.
 
@@ -131,32 +133,37 @@ left off.
 
 ## 4. The entry point — `run()`
 
-Every tool implements `run(state)` (see `worker/tools/base.py`). For the
-questionnaire it's just two lines that pick the phase:
+Every subagent implements `run(query, ctx)` (see `worker/agents/base.py`).
+For the questionnaire it picks the phase from the shared message log:
 
 ```python
-# worker/tools/questionnaire_tool.py:34
-async def run(self, state: dict) -> list[dict]:
-    if questionnaire_pending(state["messages"]):
-        return await self._collect(state)   # questions already asked → collect answers
-    return await self._ask(state)           # nothing pending → start the questionnaire
+# worker/agents/questionnaire_agent.py
+async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+    state = {"user_input": query, "messages": ctx.messages, ...}
+    if questionnaire_pending(ctx.messages):
+        entries = await self._collect(state)  # questions already asked → collect answers
+    else:
+        entries = await self._ask(state)      # nothing pending → start the questionnaire
+    ...
+    return AgentResult(text=text, entries=entries)
 ```
 
-`state` is the current conversation state. The only two fields the tool reads
-are `state["messages"]` (the whole message log) and `state["user_input"]` (the
-user's latest message).
+The only two fields the agent reads are `ctx.messages` (the whole message log)
+and `query` (the user's latest message).
 
-`run()` returns a **list of message entries**. Each entry is a dict with at
-least `role`, `agent`, `type`, `content`, plus extra fields that define the
-message's own JSON shape. `tool_node` persists every entry to the DB and
-streams the `ASSISTANT` ones to the frontend.
+The questionnaire is the one agent that owns its own message-log entries (the
+frontend slide-UI contract depends on their exact shapes), so it returns them
+via `AgentResult.entries`. Each entry is a dict with at least `role`, `agent`,
+`type`, `content`, plus extra fields that define the message's own JSON shape.
+The composer persists every entry to the DB and streams the `ASSISTANT` ones
+to the frontend.
 
 ---
 
 ## 5. Phase 1 — `_ask()` (start the interview)
 
 ```python
-# worker/tools/questionnaire_tool.py:39
+# worker/agents/questionnaire_agent.py
 async def _ask(self, state: dict) -> list[dict]:
     idea = str(state.get("user_input") or "").strip()
 
@@ -202,7 +209,7 @@ Step by step:
 4. **Seed the answers.** We start the answer sheet with `business_about` (the
    raw idea text) plus any facts the idea already stated. The list of known
    keys is `FACTS_KEYS = ("business_location", "business_vision", "target_customers")`
-   (`questionnaire_tool.py:22`).
+   (`questionnaire_agent.py`).
 5. **Rename the session.** `update_session_business_idea(session_id, idea)`
    sets the session's title / `business_idea` to the idea.
 6. **Return two entries**:
@@ -216,7 +223,7 @@ Step by step:
 ## 6. Phase 2 — `_collect()` (gather the answers)
 
 ```python
-# worker/tools/questionnaire_tool.py:77
+# worker/agents/questionnaire_agent.py
 async def _collect(self, state: dict) -> list[dict]:
     prior = last_message(state["messages"], "questionnaire")
     questions = prior.get("questions", []) if prior else []
@@ -316,7 +323,7 @@ These are the bouncer's two re-ask scripts.
 ### `_request_idea()` — used when the first message isn't an idea
 
 ```python
-# worker/tools/questionnaire_tool.py:132
+# worker/agents/questionnaire_agent.py
 def _request_idea(self, raw: str) -> list[dict]:
     return [
         {"role": "USER", "agent": "TOOL", "type": "questionnaire_request",
@@ -336,7 +343,7 @@ message will be re-checked as a potential idea.
 ### `_reask()` — used when the answers are nonsense
 
 ```python
-# worker/tools/questionnaire_tool.py:113
+# worker/agents/questionnaire_agent.py
 def _reask(self, questions: list[dict], facts: dict, answers_text: str) -> list[dict]:
     return [
         {"role": "USER", "agent": "TOOL", "type": "questionnaire_invalid",
@@ -362,7 +369,7 @@ something in simpler words, what a term means, why it's asked, or an example —
 `_explain()` answers it conversationally instead of re-asking:
 
 ```python
-# worker/tools/questionnaire_tool.py — _explain()
+# worker/agents/questionnaire_agent.py — _explain()
 return [
     {"role": "USER", "agent": "TOOL", "type": "chat", "content": user_text},
     {"role": "ASSISTANT", "agent": "TOOL", "type": "chat",
@@ -432,7 +439,7 @@ just a prompt template piped into the model. The prompts live in
 A typical call looks like:
 
 ```python
-# worker/tools/questionnaire_tool.py:150
+# worker/agents/questionnaire_agent.py
 async def _plan(self, idea: str) -> dict:
     chain = PLAN_QUESTIONNAIRE_TEMPLATE | self.llm
     response = await chain.ainvoke({"idea": idea, "max_questions": MAX_QUESTIONS})
@@ -483,14 +490,15 @@ def business_context(messages: list[dict]) -> dict:
     return {}
 ```
 
-This dict is passed to the chat agent and other tools (see
-`worker/agent.py:65`, `chat_node`) so every reply knows the business it's
+This dict is passed to the chat agent and other subagents (via
+`AgentContext.business_context`) so every reply knows the business it's
 talking about.
 
-**The context gate.** `worker/agent.py` refuses to run tools that declare
-`requires_context = True` (SWOT, web research) until
-`questionnaire_complete(messages)` returns `True` — i.e. until this dict is
-populated. Until then those requests are routed to the questionnaire tool.
+**The context gate.** The planner refuses to select subagents that declare
+`requires_context = True` (SWOT, web research, economics, foresight) — and
+refuses `dashboard` mode — until `questionnaire_complete(messages)` returns
+`True`, i.e. until this dict is populated. Until then those requests are
+routed to the questionnaire.
 
 ---
 
@@ -528,8 +536,8 @@ completes.
 
 **Turn 1** — User: `"Start the business questionnaire"`
 
-1. `router_node`: no questionnaire pending → LLM classifies → tool
-   `questionnaire` (matches the tool's `example`).
+1. Planner: no questionnaire pending → LLM plan → mode `questionnaire`
+   (matches the agent's `example`).
 2. `_ask()` → `_is_real_idea("Start the business questionnaire")` → **false**.
 3. `_request_idea()` returns `questionnaire_request` (USER) + `chat`
    (ASSISTANT): *"Sure! To get started, could you share a little about your
@@ -546,7 +554,7 @@ completes.
 
 **Turn 3** — User: `"bla bal ....."`
 
-1. `router_node`: questionnaire pending → routes straight to the tool (no LLM).
+1. Planner: questionnaire pending → mode `questionnaire` (no LLM call).
 2. `_collect()` → `_validate(...)` → **false**.
 3. `_is_clarification(...)` → **false** (it's nonsense, not a question).
 4. `_reask()` emits `questionnaire_invalid` (USER) + `questionnaire`
@@ -555,7 +563,7 @@ completes.
 
 **Turn 3b** — User (instead): `"1) can you explain this in clear words.."`
 
-1. `router_node`: questionnaire pending → routes straight to the tool.
+1. Planner: questionnaire pending → mode `questionnaire` (no LLM call).
 2. `_collect()` → `_validate(...)` → **false** (not an answer).
 3. `_is_clarification(...)` → **true** (a question about the questionnaire).
 4. `_explain()` emits two `chat` bubbles: the user's question + a plain-language
@@ -585,7 +593,7 @@ the context-gated tools (SWOT, web search, ...).
 - **Change the question cap**: edit `MAX_QUESTIONS` in
   `worker/prompts/questionnaire.py:3`.
 - **Change which facts are seeded from the idea**: edit `FACTS_KEYS` in
-  `questionnaire_tool.py:22` (and mirror it in `PLAN_QUESTIONNAIRE_PROMPT`).
+  `questionnaire_agent.py` (and mirror it in `PLAN_QUESTIONNAIRE_PROMPT`).
 - **Change the guardrail strictness**: edit `VALIDATE_ANSWERS_PROMPT` /
   `IS_IDEA_PROMPT` in `worker/prompts/questionnaire.py`.
 - **Re-ask wording**: edit the `content` strings in `_request_idea()` /
@@ -617,8 +625,10 @@ cd /home/harish/Code/KapexAI && PYTHONPATH=. .venv/bin/python -m pytest worker/t
 - Two LLM-powered guards keep the interview on track: `_is_real_idea`
   (command phrases can't become the idea) and `_validate` (nonsense answers
   can't become context). Both fail safely.
-- The tool is the **context gatekeeper**: `requires_context` tools (SWOT, web
-  research) don't run until `questionnaire_complete` exists.
-- The tool returns **message entries**, and `tool_node` handles persisting +
-  streaming them — the tool itself never touches the DB or pub/sub directly
-  (except the session-title update in `_ask`).
+- The questionnaire is the **context gatekeeper**: `requires_context`
+  subagents (SWOT, web research) and `dashboard` mode don't run until
+  `questionnaire_complete` exists — the planner enforces this.
+- The agent returns **message entries** (`AgentResult.entries`), and the
+  composer handles persisting + streaming them — the agent itself never
+  touches the DB or pub/sub directly (except the session-title update in
+  `_ask`).

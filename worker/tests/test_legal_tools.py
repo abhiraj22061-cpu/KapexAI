@@ -1,11 +1,11 @@
 import json
 import time
-import pytest
 from types import SimpleNamespace
 
-from conftest import run as _run
+from conftest import llm_plan_from, make_ctx, run as _run
 from langchain_core.runnables import RunnableLambda
 
+from worker.orchestrator.composer import assistant_card
 from worker.helpers.cached_http import _cache_key
 from worker.helpers.indian_sources import (
     INDIAN_OFFICIAL_SOURCES,
@@ -13,18 +13,19 @@ from worker.helpers.indian_sources import (
     official_domains,
 )
 
-# NOTE: import order matters. `worker.tools.legal_tools` loads the root `.env`
+# NOTE: import order matters. `worker.agents.legal_agents` loads the root `.env`
 # (via python-dotenv) before importing `cached_http`, so the redis_service
 # client is created against the real REDIS_URL instead of localhost.
-from worker.tools import legal_tools as lt
-from worker.tools.base import Tool
-from worker.tools.registry import get_tool, list_tools
+from worker.agents import legal_agents as lt
+from worker.agents.base import SubAgent as Tool
+from worker.agents.registry import get_subagent as get_tool, list_subagents as list_tools
 
 TEST_IDEA = "I want to open a specialty coffee shop in Pune."
 TEST_EMAIL = "legal-tools-test@example.com"
 
 
 def _state(request="What licences does a food business need?", messages=None):
+    """Old-style state dict; `_run_agent` adapts it to the subagent contract."""
     return {
         "session_id": "s",
         "user_input": request,
@@ -40,6 +41,22 @@ def _state(request="What licences does a food business need?", messages=None):
             },
         ],
     }
+
+
+def _run_agent(agent, state):
+    """Runs a subagent from an old-style state dict and returns its result
+    rendered as the message the composer would persist (minus the USER echo,
+    which the composer now owns)."""
+    ctx = make_ctx(
+        request=str(state.get("user_input") or ""),
+        messages=state.get("messages") or [],
+        session_id=state.get("session_id", "s"),
+    )
+    return _run(agent.run(ctx.user_input, ctx))
+
+
+def _card(state, agent):
+    return assistant_card(_run_agent(agent, state))
 
 
 # ── registry & tool metadata ────────────────────────────────
@@ -62,15 +79,15 @@ def test_legal_tools_in_suggestion_listing():
 
 
 def test_legal_tools_do_not_require_context():
-    assert lt.IndianLegalSearchTool.requires_context is False
-    assert lt.IndianCaseSearchTool.requires_context is False
-    assert lt.LegalIssueRegisterTool.requires_context is False
+    assert lt.IndianLegalSearchAgent.requires_context is False
+    assert lt.IndianCaseSearchAgent.requires_context is False
+    assert lt.LegalIssueRegisterAgent.requires_context is False
 
 
 def test_legal_tools_are_tool_subclasses():
-    assert issubclass(lt.IndianLegalSearchTool, Tool)
-    assert issubclass(lt.IndianCaseSearchTool, Tool)
-    assert issubclass(lt.LegalIssueRegisterTool, Tool)
+    assert issubclass(lt.IndianLegalSearchAgent, Tool)
+    assert issubclass(lt.IndianCaseSearchAgent, Tool)
+    assert issubclass(lt.LegalIssueRegisterAgent, Tool)
 
 
 # ── official-domain allowlist ───────────────────────────────
@@ -493,13 +510,13 @@ def test_token_never_leaks_into_output(monkeypatch):
 
     monkeypatch.setattr(lt, "cached_json", fake_cached_json)
     monkeypatch.setenv("TAVILY_API_KEY", "SECRETTOKEN123")
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_extract_results", fake_extract)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_extract_results", fake_extract)
 
-    tool = lt.IndianLegalSearchTool()
-    entries = _run(tool.run(_state()))
+    tool = lt.IndianLegalSearchAgent()
+    msg = _card(_state(), tool)
     assert captured["headers"]["Authorization"] == "Bearer SECRETTOKEN123"
-    assert "SECRETTOKEN123" not in json.dumps(entries)
+    assert "SECRETTOKEN123" not in json.dumps(msg)
     key = _cache_key("POST", lt.TAVILY_SEARCH_URL, None, None, None)
     assert "SECRETTOKEN123" not in key
 
@@ -546,20 +563,14 @@ def test_legal_search_run_happy_path(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_search", fake_search)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_extract_results", fake_extract)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_search", fake_search)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_extract_results", fake_extract)
 
-    tool = lt.IndianLegalSearchTool()
-    entries = _run(tool.run(_state()))
-
-    assert entries[0] == {
-        "role": "USER",
-        "agent": "TOOL",
-        "type": "legal_request",
-        "content": "What licences does a food business need?",
-    }
-    msg = entries[1]
+    tool = lt.IndianLegalSearchAgent()
+    msg = _card(_state(), tool)
+    assert msg["role"] == "ASSISTANT"
+    assert msg["agent"] == "TOOL"
     assert msg["type"] == "legal_research"
     assert msg["query"] == "FSSAI food business licence india"
     assert len(msg["results"]) == 1
@@ -584,26 +595,25 @@ def test_legal_search_run_no_results(monkeypatch):
     async def fake_extract(self, payload, request):
         return []
 
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_search", fake_search)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_extract_results", fake_extract)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_search", fake_search)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_extract_results", fake_extract)
 
-    entries = _run(lt.IndianLegalSearchTool().run(_state()))
-    assert entries[1]["type"] == "legal_research"
-    assert entries[1]["results"] == []
+    msg = _card(_state(), lt.IndianLegalSearchAgent())
+    assert msg["type"] == "legal_research"
+    assert msg["results"] == []
 
 
 def test_legal_search_missing_credentials(monkeypatch):
     async def fake_build(self, request, context, transcript):
         return "query"
 
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_build_query", fake_build)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
-    entries = _run(lt.IndianLegalSearchTool().run(_state()))
-    assert entries[0]["type"] == "legal_request"
-    assert entries[1]["type"] == "missing_credentials"
-    assert "TAVILY_API_KEY" in entries[1]["content"]
+    msg = _card(_state(), lt.IndianLegalSearchAgent())
+    assert msg["type"] == "missing_credentials"
+    assert "TAVILY_API_KEY" in msg["content"]
 
 
 def test_legal_search_service_error(monkeypatch):
@@ -613,12 +623,12 @@ def test_legal_search_service_error(monkeypatch):
     async def fake_search(self, query):
         raise lt.ToolServiceError("Tavily is unavailable (HTTP 500)")
 
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_search", fake_search)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_search", fake_search)
 
-    entries = _run(lt.IndianLegalSearchTool().run(_state()))
-    assert entries[1]["type"] == "tool_error"
-    assert "Tavily is unavailable" in entries[1]["content"]
+    msg = _card(_state(), lt.IndianLegalSearchAgent())
+    assert msg["type"] == "tool_error"
+    assert "Tavily is unavailable" in msg["content"]
 
 
 def test_case_search_run(monkeypatch):
@@ -639,12 +649,10 @@ def test_case_search_run(monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(lt.IndianCaseSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianCaseSearchTool, "_search", fake_search)
+    monkeypatch.setattr(lt.IndianCaseSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianCaseSearchAgent, "_search", fake_search)
 
-    entries = _run(lt.IndianCaseSearchTool().run(_state("find cases about labels")))
-    assert entries[0]["type"] == "case_search_request"
-    msg = entries[1]
+    msg = _card(_state("find cases about labels"), lt.IndianCaseSearchAgent())
     assert msg["type"] == "case_search"
     assert msg["query"] == "food packaging label high court"
     case = msg["cases"][0]
@@ -661,12 +669,12 @@ def test_case_search_missing_token(monkeypatch):
     async def fake_build(self, request, transcript):
         return "query"
 
-    monkeypatch.setattr(lt.IndianCaseSearchTool, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianCaseSearchAgent, "_build_query", fake_build)
     monkeypatch.delenv("INDIANKANOON_API_TOKEN", raising=False)
 
-    entries = _run(lt.IndianCaseSearchTool().run(_state()))
-    assert entries[1]["type"] == "missing_credentials"
-    assert "INDIANKANOON_API_TOKEN" in entries[1]["content"]
+    msg = _card(_state(), lt.IndianCaseSearchAgent())
+    assert msg["type"] == "missing_credentials"
+    assert "INDIANKANOON_API_TOKEN" in msg["content"]
 
 
 def test_issue_register_run(monkeypatch):
@@ -708,12 +716,10 @@ def test_issue_register_run(monkeypatch):
             ]
         }
     )
-    tool = lt.LegalIssueRegisterTool()
+    tool = lt.LegalIssueRegisterAgent()
     tool.llm = RunnableLambda(lambda inputs: SimpleNamespace(content=llm_output))
 
-    entries = _run(tool.run(state))
-    assert entries[0]["type"] == "issue_register_request"
-    msg = entries[1]
+    msg = _card(state, tool)
     assert msg["type"] == "issue_register"
     issues = msg["issues"]
     assert len(issues) == 2
@@ -769,8 +775,9 @@ def test_legal_prompt_templates_render():
 from db_service import db
 from redis_service import redis
 
-from worker.agent import build_graph, process_job
-from worker.agents.router_agent import RouterAgent
+from worker.agent import process_job
+from worker.orchestrator import Orchestrator
+from worker.orchestrator.planner import Planner
 from worker.helpers.persistence import add_message
 
 
@@ -859,20 +866,20 @@ def test_legal_search_flow_streams_and_persists(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_search", fake_search)
-    monkeypatch.setattr(lt.IndianLegalSearchTool, "_extract_results", fake_extract)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_search", fake_search)
+    monkeypatch.setattr(lt.IndianLegalSearchAgent, "_extract_results", fake_extract)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
         await _seed_completed_questionnaire(sid)
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "What licences?"}, graph
+                {"session_id": sid, "user_input": "What licences?"}, engine
             )
             events = await _collect(ps, 3)
 
@@ -896,7 +903,7 @@ def test_legal_search_flow_streams_and_persists(monkeypatch):
             assert events[2]["type"] == "end"
 
             msgs = await db.message.find_many(where={"sessionId": sid})
-            assert sorted(m.agent for m in msgs) == ["CHAT", "TOOL", "TOOL", "TOOL"]
+            assert sorted(m.agent for m in msgs) == ["CHAT", "CHAT", "TOOL", "TOOL"]
 
             await ps.unsubscribe(f"stream:{sid}")
             await ps.close()
@@ -929,18 +936,18 @@ def test_case_search_flow_runs_without_questionnaire(monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(lt.IndianCaseSearchTool, "_build_query", fake_build)
-    monkeypatch.setattr(lt.IndianCaseSearchTool, "_search", fake_search)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(lt.IndianCaseSearchAgent, "_build_query", fake_build)
+    monkeypatch.setattr(lt.IndianCaseSearchAgent, "_search", fake_search)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "Find judgments"}, graph
+                {"session_id": sid, "user_input": "Find judgments"}, engine
             )
             events = await _collect(ps, 2)
 
@@ -986,17 +993,17 @@ def test_issue_register_flow(monkeypatch):
     chain = RunnableLambda(lambda inputs: SimpleNamespace(content=llm_output))
     registered = get_tool("legal_issue_register")
     monkeypatch.setattr(registered, "llm", chain)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
         await _seed_completed_questionnaire(sid)
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "List my compliance issues"}, graph
+                {"session_id": sid, "user_input": "List my compliance issues"}, engine
             )
             events = await _collect(ps, 3)
 

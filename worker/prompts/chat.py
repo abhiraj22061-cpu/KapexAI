@@ -16,6 +16,9 @@ Known business context (gathered from the questionnaire):
 You have access to specialized tools that you can suggest, but you do not call them yourself:
 {tools}
 
+Findings gathered by research subagents just for this reply (use them to answer; may be empty):
+{notes}
+
 Conversation so far:
 {transcript}
 

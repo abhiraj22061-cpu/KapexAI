@@ -63,14 +63,47 @@ async def add_message(session_id: str, role: str, agent: str, content: dict):
     )
 
 
+async def create_dashboard(session_id: str, name: str, data: dict):
+    return await db.dashboard.create(
+        data={
+            "sessionId": session_id,
+            "name": name,
+            "data": Json(data),
+        }
+    )
+
+
+async def expand_dashboards(messages: list[dict]) -> list[dict]:
+    """Re-attaches `dashboard_data` to dashboard entries by batch-loading the
+    referenced rows. The message log only stores the reference, so a dashboard
+    edit (or a cache rebuilt before the feature existed) always resolves to the
+    current document. Entries whose row is missing stay as bare references."""
+    ids = [
+        m["dashboard_id"]
+        for m in messages
+        if m.get("type") == "dashboard"
+        and m.get("dashboard_id")
+        and "dashboard_data" not in m
+    ]
+    if not ids:
+        return messages
+    rows = await db.dashboard.find_many(where={"id": {"in": ids}})
+    by_id = {row.id: row.data for row in rows}
+    out = []
+    for msg in messages:
+        data = by_id.get(msg.get("dashboard_id"))
+        if data is not None and "dashboard_data" not in msg:
+            msg = {**msg, "dashboard_data": data}
+        out.append(msg)
+    return out
+
+
 def _empty_state(session_id: str, user_id: str) -> dict:
     return {
         "session_id": session_id,
         "user_id": user_id,
         "user_input": "",
         "messages": [],
-        "intent": "",
-        "tool": "",
     }
 
 

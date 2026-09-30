@@ -1,6 +1,7 @@
 import type { ComponentType } from 'react'
 import { AstrologyCard } from './AstrologyCard'
 import { CaseSearchCard } from './CaseSearchCard'
+import { DashboardCard } from './DashboardCard'
 import { IssueRegisterCard } from './IssueRegisterCard'
 import { LegalResearchCard } from './LegalResearchCard'
 import { IndianFinanceCard } from './IndianFinanceCard'
@@ -39,6 +40,7 @@ const registry: Record<string, ComponentType<MessageComponentProps>> = {
   case_search: CaseSearchCard,
   issue_register: IssueRegisterCard,
   indian_finance: IndianFinanceCard,
+  dashboard: DashboardCard,
 }
 
 export function MessageContent(props: MessageComponentProps) {

@@ -1,4 +1,10 @@
 from worker.prompts.chat import CHAT_PROMPT, CHAT_TEMPLATE
+from worker.prompts.orchestrator import (
+    DASHBOARD_NARRATIVE_PROMPT,
+    DASHBOARD_NARRATIVE_TEMPLATE,
+    PLAN_PROMPT,
+    PLAN_TEMPLATE,
+)
 from worker.prompts.questionnaire import (
     MAX_QUESTIONS,
     PARSE_ANSWERS_PROMPT,
@@ -7,20 +13,21 @@ from worker.prompts.questionnaire import (
     PLAN_QUESTIONNAIRE_TEMPLATE,
 )
 from worker.prompts.research_websearch import RESEARCH_WEBSEARCH_PROMPT
-from worker.prompts.router import ROUTER_PROMPT, ROUTER_TEMPLATE
 from worker.prompts.swot import SWOT_PROMPT, SWOT_TEMPLATE
 
 __all__ = [
     "CHAT_PROMPT",
     "CHAT_TEMPLATE",
+    "DASHBOARD_NARRATIVE_PROMPT",
+    "DASHBOARD_NARRATIVE_TEMPLATE",
     "MAX_QUESTIONS",
     "PARSE_ANSWERS_PROMPT",
     "PARSE_ANSWERS_TEMPLATE",
+    "PLAN_PROMPT",
     "PLAN_QUESTIONNAIRE_PROMPT",
     "PLAN_QUESTIONNAIRE_TEMPLATE",
+    "PLAN_TEMPLATE",
     "RESEARCH_WEBSEARCH_PROMPT",
-    "ROUTER_PROMPT",
-    "ROUTER_TEMPLATE",
     "SWOT_PROMPT",
     "SWOT_TEMPLATE",
 ]

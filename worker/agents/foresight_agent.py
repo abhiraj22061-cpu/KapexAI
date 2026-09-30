@@ -5,16 +5,15 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.http_cache import cached_json
 from worker.helpers.json_utils import extract_text, parse_json
-from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.foresight import (
     FORESIGHT_PLAN_TEMPLATE,
     FORESIGHT_SUMMARY_TEMPLATE,
 )
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 JPL_SOURCE = "https://ssd.jpl.nasa.gov/api/horizons.api"
 
@@ -98,7 +97,7 @@ def future_signpost_matrix(scenarios: list[dict]) -> dict:
     }
 
 
-class ForesightTool(Tool):
+class ForesightAgent(SubAgent):
     name = "foresight"
     description = (
         "Builds structured scenario-planning analyses for business decisions (probable futures, "
@@ -110,12 +109,12 @@ class ForesightTool(Tool):
     requires_context = True
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
+        self.llm = get_llm(0.1)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "").strip()
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        request = query.strip()
+        context = ctx.business_context
+        transcript = ctx.transcript
 
         plan = await self._plan(request, context, transcript)
         operation = str(plan.get("operation") or "")
@@ -126,22 +125,15 @@ class ForesightTool(Tool):
         raw = await self._dispatch(operation, args)
         summary = await self._summarize(request, context, transcript, raw)
 
-        return [
-            {
-                "role": "USER",
-                "agent": "TOOL",
-                "type": "foresight_request",
-                "content": request,
-            },
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "foresight",
-                "content": summary,
-                "data": raw,
-                "source": raw.get("source", ""),
-            },
-        ]
+        sources = []
+        if raw.get("source"):
+            sources = [{"label": "NASA JPL Horizons", "url": str(raw["source"])}]
+        return AgentResult(
+            text=summary,
+            data={"data": raw, "source": raw.get("source", "")},
+            message_type="foresight",
+            sources=sources,
+        )
 
     async def _plan(self, request: str, context: dict, transcript: str) -> dict:
         """Asks the LLM which foresight operation to run (and builds scenarios

@@ -20,11 +20,20 @@ export type BusinessProfile = {
   monthly_expenditure?: string
 }
 
+/** Summary row of a dashboard generated for a session (full payload via `getDashboard`). */
+export type DashboardInfo = {
+  id: string
+  name: string
+  created_at: string
+}
+
 export type SessionInfo = {
   id: string
   business_idea: string
   status: string
   created_at: string
+  /** Dashboards generated in this session, oldest first. */
+  dashboards: DashboardInfo[]
 }
 
 export type QuestionnaireQuestion = {
@@ -120,6 +129,41 @@ export type ToolInfo = {
   suggestion: string
 }
 
+/** One section of a dashboard document — bullet list or free (markdown) text. */
+export type DashboardSection = {
+  heading: string
+  kind: 'bullets' | 'text'
+  items?: string[]
+  text?: string
+}
+
+/** A grounded recommendation. `source` is only set when `origin` is "sourced". */
+export type DashboardSuggestion = {
+  text: string
+  source: { label: string; url: string } | null
+  origin: 'sourced' | 'ai'
+}
+
+/** The JSON document the worker stores in `Dashboard.data`. */
+export type DashboardData = {
+  kind: string
+  kind_label: string
+  name: string
+  title: string
+  subtitle: string | null
+  intro: string
+  summary: string | null
+  sections: DashboardSection[]
+  suggestions: DashboardSuggestion[]
+  sources: { label: string; url: string }[]
+}
+
+/** Full dashboard row + payload as returned by `GET /get_dashboard`. */
+export type DashboardDetail = DashboardInfo & {
+  session_id: string
+  data: DashboardData
+}
+
 /**
  * Frames published by the worker to `stream:{session_id}` and forwarded
  * verbatim by the backend WebSocket (`/ws/session/{session_id}`).
@@ -173,6 +217,14 @@ export type StreamFrame =
       content: string
       calculation_type: string
       result: Record<string, unknown>
+    }
+  | {
+      type: 'dashboard'
+      content: string
+      dashboard_id: string
+      dashboard_name: string
+      /** Expanded payload — present on live stream frames only (history loads fetch it). */
+      dashboard_data: DashboardData
     }
   | { type: 'suggestions'; tools: ToolInfo[] }
   | { type: 'end' }

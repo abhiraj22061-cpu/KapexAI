@@ -2,7 +2,9 @@
 
 KapexAI is a business consultant chatbot. A user describes their business idea
 and KapexAI helps them think it through: it asks a few questions, can research
-topics on the web, and can produce analyses like a SWOT breakdown.
+topics on the web, can produce analyses like a SWOT breakdown, and can build
+full dashboard reports (SWOT, market/competitor/financial/risk/scenario
+analysis).
 
 ## How it works
 
@@ -11,16 +13,17 @@ The project is split into three parts that run together:
 - **Backend** (`backend/`) - a FastAPI app that exposes the chat endpoints and
   streams responses to the frontend over a WebSocket.
 - **Worker** (`worker/`) - a background process that picks up each user message
-  and decides what to do with it. Every message either gets a conversational
-  reply or is handed to one of the available tools.
+  and runs it through an orchestrator (planner → subagents → composer). Every
+  message either gets a conversational reply, an inline tool card, another
+  questionnaire round, or a new dashboard.
 - **Services** (`services/`) - PostgreSQL for storing conversations and Redis
   for the job queue and real-time streaming.
 
-## Tools
+## Subagents
 
-Tools are the capabilities the chatbot can use. They are registered in one place
-(`worker/tools/registry.py`), so adding a new one means writing a class and
-registering it.
+Subagents are the capabilities the chatbot can use. They are registered in one
+place (`worker/agents/registry.py`), so adding a new one means writing a class
+and registering it.
 
 Currently available:
 
@@ -29,10 +32,17 @@ Currently available:
 - **Web search** - researches a topic, a competitor, or a market on the web.
 - **SWOT** - produces a SWOT (strengths, weaknesses, opportunities, threats)
   analysis.
-- **Finance** - financial calculations and analysis: returns, valuation, risk,
-  equity metrics, and SEC public-company filing lookups. Powered by an internal
-  agent over 109 calculator functions (see `worker/tools/finance_tool.py`);
-  SEC lookups need `SEC_USER_AGENT` set.
+- **Economics / Foresight** - economic data and scenario outlook for the
+  business.
+- **Finance / Indian finance** - financial calculations and analysis: returns,
+  valuation, risk, equity metrics, SEC public-company filing lookups, and
+  Indian calculators (SIP, EMI, tax). The finance agent powers 109 internal
+  calculator functions (see `worker/tools/finance_calculators.py`); SEC lookups
+  need `SEC_USER_AGENT` set.
+- **Indian legal search / Case search / Issue register** - official Indian
+  regulatory sources, Indian Kanoon case law, and a deterministically scored
+  compliance issue register.
+- **Astrology** - an astrology perspective (with disclaimer).
 
 ## Getting started
 
@@ -53,5 +63,11 @@ make dev-backend   # FastAPI server
 make dev-worker    # background worker
 ```
 
-The frontend is not built yet. Until it is, the chat session can be driven
-through the backend API directly.
+Start the frontend in a third terminal:
+
+```sh
+cd frontend && npm install && npm run dev   # http://localhost:3000
+```
+
+Further reading: `docs/agentic-pipeline.md` (orchestrator, subagents,
+dashboards, streaming) and `AGENTS.md` (contributor guide).

@@ -36,3 +36,41 @@ def services():
     run(disconnect_db())
     run(_loop.shutdown_asyncgens())
     _loop.close()
+
+def llm_plan_from(fake_classify):
+    """Adapts an old-style `RouterAgent.classify` fake to `Planner._llm_plan`.
+    The planner's deterministic gates (pending questionnaire, context-gating,
+    questionnaire-after-complete, unknown-name drops) still run for real."""
+
+    async def fake_llm_plan(self, user_input, messages, ready):
+        decision = await fake_classify(None, user_input, messages, None)
+        if isinstance(decision, dict) and decision.get("intent") == "tool" and decision.get("tool"):
+            name = decision["tool"]
+            if name == "questionnaire":
+                return {"mode": "questionnaire", "subagents": []}
+            return {
+                "mode": "inline",
+                "subagents": [{"name": name, "query": user_input}],
+                "reply_instruction": "",
+            }
+        return {"mode": "chat", "subagents": []}
+
+    return fake_llm_plan
+
+
+def make_ctx(request="", messages=None, session_id="s", user_id=""):
+    """Builds an AgentContext the way the orchestrator does (for unit tests
+    that drive a subagent directly with an old-style state dict)."""
+    from worker.agents.base import AgentContext
+    from worker.helpers.messages import business_context, format_transcript
+
+    messages = messages or []
+    return AgentContext(
+        session_id=session_id,
+        user_id=user_id,
+        user_input=request,
+        messages=messages,
+        business_context=business_context(messages),
+        transcript=format_transcript(messages),
+    )
+

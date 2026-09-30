@@ -1,15 +1,14 @@
-"""Indian legal & regulatory research tools.
+"""Indian legal & regulatory research subagents.
 
-Three tools ride the generic tool→router→message-log pipeline exactly like the
-SWOT tool — no router, agent, or suggestion-system changes are required:
+Three subagents answer the orchestrator's questions over the message log:
 
 * ``indian_legal_search``   — discovery-only Tavily search biased towards the
   official Indian regulatory domains in ``worker/helpers/indian_sources.py``;
-  emits ``legal_research`` (and ``legal_request``) entries.
-* ``indian_case_search``    — Indian Kanoon API search; emits ``case_search``
-  (and ``case_search_request``) entries.
+  returns ``legal_research`` cards.
+* ``indian_case_search``    — Indian Kanoon API search; returns ``case_search``
+  cards.
 * ``legal_issue_register``  — LLM-identified issues validated and scored
-  deterministically; emits ``issue_register`` entries.
+  deterministically; returns ``issue_register`` cards.
 
 Grounding rules are enforced in Python, not just prompts: URLs/authorities are
 only ever taken from actual retrieval results, ``effective_date`` is never
@@ -25,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.cached_http import (
     ToolConfigurationError,
@@ -35,14 +34,13 @@ from worker.helpers.cached_http import (
 )
 from worker.helpers.indian_sources import classify_source, official_domains
 from worker.helpers.json_utils import parse_json
-from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.legal import (
     INDIAN_CASE_QUERY_TEMPLATE,
     INDIAN_ISSUE_REGISTER_TEMPLATE,
     INDIAN_LEGAL_EXTRACTION_TEMPLATE,
     INDIAN_LEGAL_QUERY_TEMPLATE,
 )
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 INDIAN_KANOON_SEARCH_URL = "https://api.indiankanoon.org/search/"
@@ -103,7 +101,7 @@ KANOON_COURTS = {
 }
 
 
-class IndianLegalSearchTool(Tool):
+class IndianLegalSearchAgent(SubAgent):
     """Tavily discovery over the official Indian regulatory allowlist."""
 
     name = "indian_legal_search"
@@ -116,53 +114,50 @@ class IndianLegalSearchTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
+        self.llm = get_llm(0.2)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "")
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        request = query
+        context = ctx.business_context
+        transcript = ctx.transcript
 
         try:
-            query = await self._build_query(request, context, transcript)
-            payload = await self._search(query)
+            built = await self._build_query(request, context, transcript)
+            payload = await self._search(built)
         except ToolConfigurationError as exc:
-            return _request_entry("legal_request", request) + _missing_credentials(
-                str(exc)
+            return AgentResult(
+                text=f"Sorry, this tool is not configured yet. {exc}",
+                message_type="missing_credentials",
             )
         except ToolServiceError as exc:
-            return _request_entry("legal_request", request) + _tool_error(str(exc))
+            return AgentResult(
+                text=f"I could not complete the search right now. {exc}",
+                message_type="tool_error",
+            )
 
         results = []
         try:
             results = await self._extract_results(payload, request)
         except ToolServiceError as exc:
-            return _request_entry("legal_request", request) + _tool_error(str(exc))
+            return AgentResult(
+                text=f"I could not complete the search right now. {exc}",
+                message_type="tool_error",
+            )
 
-        if not results:
-            return _request_entry("legal_request", request) + [
-                {
-                    "role": "ASSISTANT",
-                    "agent": "TOOL",
-                    "type": "legal_research",
-                    "content": _format_research(query, []),
-                    "query": query,
-                    "results": [],
-                    "disclaimer": LEGAL_RESEARCH_DISCLAIMER,
-                }
-            ]
-
-        return _request_entry("legal_request", request) + [
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "legal_research",
-                "content": _format_research(query, results),
-                "query": query,
+        return AgentResult(
+            text=_format_research(built, results),
+            data={
+                "query": built,
                 "results": results,
                 "disclaimer": LEGAL_RESEARCH_DISCLAIMER,
-            }
-        ]
+            },
+            message_type="legal_research",
+            sources=[
+                {"label": r.get("title") or r["source_url"], "url": r["source_url"]}
+                for r in results
+                if r.get("source_url")
+            ],
+        )
 
     async def _build_query(self, request: str, context: dict, transcript: str) -> str:
         chain = INDIAN_LEGAL_QUERY_TEMPLATE | self.llm
@@ -211,7 +206,7 @@ class IndianLegalSearchTool(Tool):
         return _validate_research_items(items, extracted)
 
 
-class IndianCaseSearchTool(Tool):
+class IndianCaseSearchAgent(SubAgent):
     """Indian Kanoon (third-party) case-law search."""
 
     name = "indian_case_search"
@@ -224,34 +219,41 @@ class IndianCaseSearchTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
+        self.llm = get_llm(0.2)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "")
-        transcript = format_transcript(state["messages"])
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        request = query
+        transcript = ctx.transcript
 
         try:
-            query = await self._build_query(request, transcript)
-            payload = await self._search(query)
+            built = await self._build_query(request, transcript)
+            payload = await self._search(built)
         except ToolConfigurationError as exc:
-            return _request_entry("case_search_request", request) + _missing_credentials(
-                str(exc)
+            return AgentResult(
+                text=f"Sorry, this tool is not configured yet. {exc}",
+                message_type="missing_credentials",
             )
         except ToolServiceError as exc:
-            return _request_entry("case_search_request", request) + _tool_error(str(exc))
+            return AgentResult(
+                text=f"I could not complete the search right now. {exc}",
+                message_type="tool_error",
+            )
 
         cases = _parse_cases(payload)
-        return _request_entry("case_search_request", request) + [
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "case_search",
-                "content": _format_cases(query, cases),
-                "query": query,
+        return AgentResult(
+            text=_format_cases(built, cases),
+            data={
+                "query": built,
                 "cases": cases,
                 "disclaimer": CASE_SEARCH_DISCLAIMER,
-            }
-        ]
+            },
+            message_type="case_search",
+            sources=[
+                {"label": c.get("case_name") or c["url"], "url": c["url"]}
+                for c in cases
+                if c.get("url")
+            ],
+        )
 
     async def _build_query(self, request: str, transcript: str) -> str:
         chain = INDIAN_CASE_QUERY_TEMPLATE | self.llm
@@ -276,7 +278,7 @@ class IndianCaseSearchTool(Tool):
         )
 
 
-class LegalIssueRegisterTool(Tool):
+class LegalIssueRegisterAgent(SubAgent):
     """Builds a deterministic scored compliance issue register."""
 
     name = "legal_issue_register"
@@ -289,13 +291,13 @@ class LegalIssueRegisterTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
+        self.llm = get_llm(0.2)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "")
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
-        available = _available_sources(state["messages"])
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        request = query
+        context = ctx.business_context
+        transcript = ctx.transcript
+        available = _available_sources(ctx.messages)
         available_urls = {s["url"] for s in available}
 
         chain = INDIAN_ISSUE_REGISTER_TEMPLATE | self.llm
@@ -311,16 +313,15 @@ class LegalIssueRegisterTool(Tool):
         raw_issues = data.get("issues", []) if isinstance(data, dict) else []
         issues = _score_issues(_validate_issues(raw_issues, available_urls))
 
-        return _request_entry("issue_register_request", request) + [
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "issue_register",
-                "content": _format_issues(issues),
-                "issues": issues,
-                "disclaimer": ISSUE_REGISTER_DISCLAIMER,
-            }
-        ]
+        return AgentResult(
+            text=_format_issues(issues),
+            data={"issues": issues, "disclaimer": ISSUE_REGISTER_DISCLAIMER},
+            message_type="issue_register",
+            sources=[
+                {"label": s.get("title") or s["url"], "url": s["url"]}
+                for s in available
+            ],
+        )
 
 
 # ── validation & formatting ─────────────────────────────────
@@ -515,34 +516,6 @@ def _available_sources(messages: list[dict]) -> list[dict]:
                         }
                     )
     return sources
-
-
-def _request_entry(req_type: str, request: str) -> list[dict]:
-    return [
-        {"role": "USER", "agent": "TOOL", "type": req_type, "content": request}
-    ]
-
-
-def _missing_credentials(message: str) -> list[dict]:
-    return [
-        {
-            "role": "ASSISTANT",
-            "agent": "TOOL",
-            "type": "missing_credentials",
-            "content": f"Sorry, this tool is not configured yet. {message}",
-        }
-    ]
-
-
-def _tool_error(message: str) -> list[dict]:
-    return [
-        {
-            "role": "ASSISTANT",
-            "agent": "TOOL",
-            "type": "tool_error",
-            "content": f"I could not complete the search right now. {message}",
-        }
-    ]
 
 
 def _score(value) -> int:

@@ -5,19 +5,18 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.json_utils import parse_json
-from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.astrology import ASTROLOGY_TEMPLATE
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 _DEFAULT_DISCLAIMER = (
     "Astrology is non-scientific and interpretive. Do not use for financial or legal decisions."
 )
 
 
-class AstrologyTool(Tool):
+class AstrologyAgent(SubAgent):
     name = "astrology"
     description = "Provide symbolic astrological chart insights for business timing, career themes, and reflective planning using Vedic and Western astrology."
     example = "Give me an astrological perspective on my business launch timing"
@@ -25,41 +24,29 @@ class AstrologyTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.4)
+        self.llm = get_llm(0.4)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "")
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
-
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
         chain = ASTROLOGY_TEMPLATE | self.llm
         response = await chain.ainvoke(
             {
-                "business_context": json.dumps(context, indent=2),
-                "transcript": transcript,
-                "request": request,
+                "business_context": json.dumps(ctx.business_context, indent=2),
+                "transcript": ctx.transcript,
+                "request": query,
             }
         )
         data = parse_json(response.content)
         if not isinstance(data, dict):
             raise TypeError(f"Unexpected astrology output: {response.content}")
 
-        return [
-            {
-                "role": "USER",
-                "agent": "TOOL",
-                "type": "astrology_request",
-                "content": request,
-            },
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "astrology",
-                "content": _format_insights(data),
+        return AgentResult(
+            text=_format_insights(data),
+            data={
                 "insights": _insights_list(data),
                 "disclaimer": str(data.get("disclaimer") or _DEFAULT_DISCLAIMER),
             },
-        ]
+            message_type="astrology",
+        )
 
 
 def _insights_list(data: dict) -> list[str]:

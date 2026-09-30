@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.json_utils import extract_text, parse_json
 from worker.helpers.messages import last_message, questionnaire_pending
@@ -21,7 +21,7 @@ from worker.prompts.questionnaire import (
     VALIDATE_ANSWERS_TEMPLATE,
     VALIDATE_STRUCTURED_ANSWER_TEMPLATE,
 )
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 FACTS_KEYS = ("business_location", "business_vision", "target_customers")
 
@@ -99,19 +99,38 @@ def _is_obvious_idea(text: str, tokens: list[str]) -> bool:
     return len(text) >= 8 and len(tokens) >= 2
 
 
-class QuestionnaireTool(Tool):
+class QuestionnaireAgent(SubAgent):
     name = "questionnaire"
     description = "Gathers the business idea and asks a few targeted questions to build context."
     example = "Start the business questionnaire"
     suggestion = "Wanna fill in the business questionnaire to give me better context?"
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
+        self.llm = get_llm(0.1)
 
-    async def run(self, state: dict) -> list[dict]:
-        if questionnaire_pending(state["messages"]):
-            return await self._collect(state)
-        return await self._ask(state)
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        # The interview logic works off the same shape the graph used to pass
+        # around; the orchestrator owns persistence/streaming, so the agent
+        # only returns the message-log entries it wants committed.
+        state = {
+            "user_input": query,
+            "messages": ctx.messages,
+            "session_id": ctx.session_id,
+            "user_id": ctx.user_id,
+        }
+        if questionnaire_pending(ctx.messages):
+            entries = await self._collect(state)
+        else:
+            entries = await self._ask(state)
+        text = next(
+            (
+                str(e.get("content") or "")
+                for e in reversed(entries or [])
+                if e.get("role") == "ASSISTANT"
+            ),
+            "",
+        )
+        return AgentResult(text=text, entries=entries)
 
     async def _ask(self, state: dict) -> list[dict]:
         idea = str(state.get("user_input") or "").strip()

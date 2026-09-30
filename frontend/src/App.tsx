@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { ProtectedRoute } from './components/auth/ProtectedRoute'
 import { BusinessProfilePage } from './pages/BusinessProfilePage'
 import { ChatPage } from './pages/ChatPage'
+import { DashboardPage } from './pages/DashboardPage'
 import { LandingPage } from './pages/LandingPage'
 import { useAuth } from './lib/auth'
 import { Analytics } from '@vercel/analytics/react'
@@ -35,6 +36,10 @@ export default function App() {
         <Route path="/" element={<HomeRedirect />} />
         <Route element={<ProtectedRoute />}>
           <Route path="/chat" element={<ChatPage />} />
+          <Route
+            path="/chat/:sessionId/dashboard/:dashboardId"
+            element={<DashboardPage />}
+          />
           <Route path="/business-profile" element={<BusinessProfilePage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

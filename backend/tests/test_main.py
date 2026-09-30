@@ -182,6 +182,7 @@ class TestCreateChatSession:
                 patch("backend.main.uuid4", return_value="job-456"),
                 patch("backend.main.redis.lpush", new_callable=AsyncMock) as mock_lpush,
                 patch("backend.main.redis.set", new_callable=AsyncMock),
+                patch("backend.main.redis.delete", new_callable=AsyncMock),
             ):
                 from backend.utils.jwt_utils import create_token
                 token = create_token({"user_id": "user-123", "email": "test@test.com"})
@@ -280,6 +281,7 @@ class TestPushChatMessage:
                 patch("backend.main.uuid4", return_value="job-789"),
                 patch("backend.main.redis.lpush", new_callable=AsyncMock) as mock_lpush,
                 patch("backend.main.redis.set", new_callable=AsyncMock),
+                patch("backend.main.redis.delete", new_callable=AsyncMock),
                 patch("backend.main.db", mock_db),
             ):
                 from backend.utils.jwt_utils import create_token
@@ -436,6 +438,7 @@ class TestSubmitQuestionnaireAnswers:
                 patch("backend.main.uuid4", return_value="job-900"),
                 patch("backend.main.redis.lpush", new_callable=AsyncMock) as mock_lpush,
                 patch("backend.main.redis.set", new_callable=AsyncMock),
+                patch("backend.main.redis.delete", new_callable=AsyncMock),
                 patch("backend.main.db", mock_db),
             ):
                 from backend.utils.jwt_utils import create_token
@@ -589,6 +592,7 @@ class TestGetSessions:
         )
         mock_user = MagicMock(id="user-123", email="test@test.com")
         mock_db = MagicMock()
+        mock_db.dashboard.find_many = AsyncMock(return_value=[])
 
         async def mock_get_current_user(authorization: str = None):
             return mock_user
@@ -618,9 +622,60 @@ class TestGetSessions:
                         "business_idea": "AI SaaS",
                         "status": "ACTIVE",
                         "created_at": "2026-01-01T00:00:00+00:00",
+                        "dashboards": [],
                     }
                 ]
             }
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_groups_dashboards_under_their_session(self, client):
+        session_mock = Mock(
+            id="s1",
+            business_idea="AI SaaS",
+            status="ACTIVE",
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        dashboard_mocks = [
+            Mock(id="d1", sessionId="s1",
+                 created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+            Mock(id="d2", sessionId="s1",
+                 created_at=datetime(2026, 1, 3, tzinfo=timezone.utc)),
+        ]
+        dashboard_mocks[0].name = "SWOT Analysis"
+        dashboard_mocks[1].name = "Market Analysis"
+        mock_user = MagicMock(id="user-123", email="test@test.com")
+        mock_db = MagicMock()
+        mock_db.dashboard.find_many = AsyncMock(return_value=dashboard_mocks)
+
+        async def mock_get_current_user(authorization: str = None):
+            return mock_user
+
+        app.dependency_overrides[get_current_user] = mock_get_current_user
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_all_sessions", new_callable=AsyncMock, return_value=[session_mock]),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_sessions",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 200
+            body = response.json()
+            assert body["data"][0]["dashboards"] == [
+                {"id": "d1", "name": "SWOT Analysis", "created_at": "2026-01-02T00:00:00+00:00"},
+                {"id": "d2", "name": "Market Analysis", "created_at": "2026-01-03T00:00:00+00:00"},
+            ]
+            mock_db.dashboard.find_many.assert_awaited_once()
         finally:
             app.dependency_overrides.clear()
 
@@ -778,6 +833,214 @@ class TestGetMessages:
         assert response.status_code == 401
 
 
+# ── Dashboards ────────────────────────────────────────────────
+
+def _auth_override():
+    mock_user = MagicMock(id="user-123", email="test@test.com")
+
+    async def mock_get_current_user(authorization: str = None):
+        return mock_user
+
+    app.dependency_overrides[get_current_user] = mock_get_current_user
+    return mock_user
+
+
+class TestGetDashboards:
+    @pytest.mark.asyncio
+    async def test_returns_dashboard_list_for_owned_session(self, client):
+        _auth_override()
+        rows = [
+            Mock(id="d1", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            Mock(id="d2", created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+        ]
+        rows[0].name = "SWOT Analysis"
+        rows[1].name = "Market Analysis"
+        mock_db = MagicMock()
+        mock_db.dashboard.find_many = AsyncMock(return_value=rows)
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="user-123")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_dashboards?session_id=s1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 200
+            assert response.json()["data"] == [
+                {"id": "d1", "name": "SWOT Analysis", "created_at": "2026-01-01T00:00:00+00:00"},
+                {"id": "d2", "name": "Market Analysis", "created_at": "2026-01-02T00:00:00+00:00"},
+            ]
+            mock_db.dashboard.find_many.assert_awaited_once_with(
+                where={"sessionId": "s1"}, order={"created_at": "asc"}
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_not_found(self, client):
+        _auth_override()
+        mock_db = MagicMock()
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=None),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_dashboards?session_id=missing",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        _auth_override()
+        mock_db = MagicMock()
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_dashboards?session_id=s1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_401_when_token_missing(self, client):
+        async with client as c:
+            response = await c.get("/get_dashboards?session_id=s1")
+
+        assert response.status_code == 401
+
+
+class TestGetDashboard:
+    @pytest.mark.asyncio
+    async def test_returns_full_dashboard_payload(self, client):
+        _auth_override()
+        mock_db = MagicMock()
+        full = Mock(
+            id="d1",
+            sessionId="s1",
+            data={"kind": "swot", "title": "SWOT", "sections": []},
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        full.name = "SWOT Analysis"
+        mock_db.dashboard.find_unique = AsyncMock(return_value=full)
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="user-123")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_dashboard?dashboard_id=d1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 200
+            body = response.json()["data"]
+            assert body["id"] == "d1"
+            assert body["name"] == "SWOT Analysis"
+            assert body["session_id"] == "s1"
+            assert body["created_at"] == "2026-01-01T00:00:00+00:00"
+            assert body["data"]["kind"] == "swot"
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_dashboard_missing(self, client):
+        _auth_override()
+        mock_db = MagicMock()
+        mock_db.dashboard.find_unique = AsyncMock(return_value=None)
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_dashboard?dashboard_id=missing",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_belongs_to_other_user(self, client):
+        _auth_override()
+        mock_db = MagicMock()
+        foreign = Mock(
+            id="d1", sessionId="s1",
+            data={}, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        foreign.name = "SWOT"
+        mock_db.dashboard.find_unique = AsyncMock(return_value=foreign)
+
+        try:
+            with (
+                patch.object(jwt_utils, "JWT_SECRET", "test-secret"),
+                patch("backend.main.get_session", new_callable=AsyncMock, return_value=Mock(id="s1", userId="other-user")),
+                patch("backend.main.db", mock_db),
+            ):
+                from backend.utils.jwt_utils import create_token
+                token = create_token({"user_id": "user-123", "email": "test@test.com"})
+
+                async with client as c:
+                    response = await c.get(
+                        "/get_dashboard?dashboard_id=d1",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+
+            assert response.status_code == 404
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_401_when_token_missing(self, client):
+        async with client as c:
+            response = await c.get("/get_dashboard?dashboard_id=d1")
+
+        assert response.status_code == 401
+
+
 # ── Rename Session ───────────────────────────────────────────
 
 class TestRenameSession:
@@ -927,6 +1190,7 @@ class TestDeleteSession:
         mock_user = MagicMock(id="user-123", email="test@test.com")
         mock_db = MagicMock()
         mock_db.message.delete_many = AsyncMock()
+        mock_db.dashboard.delete_many = AsyncMock()
         mock_db.session.delete = AsyncMock()
 
         async def mock_get_current_user(authorization: str = None):
@@ -956,6 +1220,7 @@ class TestDeleteSession:
             mock_redis_delete.assert_any_await("langgraph_state:s1")
             mock_redis_delete.assert_any_await("pending:s1")
             mock_db.message.delete_many.assert_awaited_once_with(where={"sessionId": "s1"})
+            mock_db.dashboard.delete_many.assert_awaited_once_with(where={"sessionId": "s1"})
             mock_db.session.delete.assert_awaited_once_with(where={"id": "s1"})
         finally:
             app.dependency_overrides.clear()
@@ -1176,79 +1441,136 @@ class TestUpdateBusinessProfile:
 # ── WebSocket Stream ─────────────────────────────────────────
 
 class TestWebSocketStream:
+    """The endpoint tails the Redis frame list (`stream:{id}:frames`) and only
+    uses pub/sub as a wakeup, so replaying a turn that finished before the
+    client connected must work even when `pending` is already cleared."""
+
     @staticmethod
-    def _build_pubsub_mock(raw_messages: list[str]):
+    def _build_pubsub_mock():
         pubsub = MagicMock()
         pubsub.subscribe = AsyncMock()
         pubsub.unsubscribe = AsyncMock()
         pubsub.close = AsyncMock()
-        pubsub.get_message = AsyncMock(
-            side_effect=[{"type": "message", "data": raw} for raw in raw_messages]
-        )
+        pubsub.get_message = AsyncMock(return_value=None)
         return pubsub
 
-    @staticmethod
-    def _mock_redis_get():
-        # A truthy pending value lets the endpoint proceed past the idle check.
-        return patch(
-            "backend.main.redis.get",
-            new_callable=AsyncMock,
-            return_value=b'{"content": "hi", "type": "chat"}',
-        )
-
-    def test_receives_single_message_then_ends(self):
-        messages = [
-            json.dumps({"type": "token", "content": "Hello"}),
+    def test_replays_buffered_turn_when_pending_already_cleared(self):
+        # The race: the worker finished (pending gone) before the client's
+        # socket connected — the buffered frames must still be delivered.
+        frames = [
+            json.dumps({"type": "chat", "content": "Hello"}),
             json.dumps({"type": "end"}),
         ]
+        pubsub = self._build_pubsub_mock()
 
-        pubsub = self._build_pubsub_mock(messages)
-
-        with self._mock_redis_get():
-            with patch("backend.main.redis.pubsub", return_value=pubsub):
-                with TestClient(app) as client:
-                    with client.websocket_connect("/ws/session/test-session") as ws:
-                        assert ws.receive_json() == {"type": "token", "content": "Hello"}
-                        assert ws.receive_json() == {"type": "end"}
-
-    def test_receives_multiple_messages_then_ends(self):
-        messages = [
-            json.dumps({"type": "token", "content": "Step 1"}),
-            json.dumps({"type": "token", "content": "Step 2"}),
-            json.dumps({"type": "end"}),
-        ]
-
-        pubsub = self._build_pubsub_mock(messages)
-
-        with self._mock_redis_get():
-            with patch("backend.main.redis.pubsub", return_value=pubsub):
-                with TestClient(app) as client:
-                    with client.websocket_connect("/ws/session/test-session") as ws:
-                        assert ws.receive_json() == {"type": "token", "content": "Step 1"}
-                        assert ws.receive_json() == {"type": "token", "content": "Step 2"}
-                        assert ws.receive_json() == {"type": "end"}
-
-    def test_websocket_accepts_connection(self):
-        pubsub = self._build_pubsub_mock(
-            [json.dumps({"type": "end"})]
-        )
-
-        with self._mock_redis_get():
-            with patch("backend.main.redis.pubsub", return_value=pubsub):
-                with TestClient(app) as client:
-                    with client.websocket_connect("/ws/session/test-session") as ws:
-                        assert ws.receive_json() == {"type": "end"}
-
-    def test_closes_when_no_job_in_flight(self):
-        pubsub = self._build_pubsub_mock([])
-
-        with patch(
-            "backend.main.redis.get", new_callable=AsyncMock, return_value=None
+        with (
+            patch(
+                "backend.main.redis.get", new_callable=AsyncMock, return_value=None
+            ),
+            patch(
+                "backend.main.redis.lrange",
+                new_callable=AsyncMock,
+                return_value=frames,
+            ),
+            patch("backend.main.redis.pubsub", return_value=pubsub),
+            TestClient(app) as client,
+            client.websocket_connect("/ws/session/test-session") as ws,
         ):
-            with patch("backend.main.redis.pubsub", return_value=pubsub):
-                with TestClient(app) as client:
-                    with client.websocket_connect("/ws/session/test-session") as ws:
-                        assert ws.receive_json() == {"type": "end"}
+                assert ws.receive_json() == {"type": "chat", "content": "Hello"}
+                assert ws.receive_json() == {"type": "end"}
+
+    def test_drains_frames_in_chunks_while_turn_runs(self):
+        # Frames arriving between wakeups are read from the list by cursor.
+        pubsub = self._build_pubsub_mock()
+        lrange_results = [
+            [json.dumps({"type": "chat", "content": "Step 1"})],
+            [json.dumps({"type": "end"})],
+        ]
+
+        with (
+            patch(
+                "backend.main.redis.get", new_callable=AsyncMock, return_value=b"pending"
+            ),
+            patch(
+                "backend.main.redis.lrange",
+                new_callable=AsyncMock,
+                side_effect=lrange_results,
+            ),
+            patch("backend.main.redis.pubsub", return_value=pubsub),
+            TestClient(app) as client,
+            client.websocket_connect("/ws/session/test-session") as ws,
+        ):
+                assert ws.receive_json() == {"type": "chat", "content": "Step 1"}
+                assert ws.receive_json() == {"type": "end"}
+
+    def test_waits_for_wakeup_when_buffer_empty_but_job_running(self):
+        # Empty buffer + job in flight → poll pub/sub, then drain the end frame.
+        pubsub = self._build_pubsub_mock()
+        lrange_results = [
+            [],  # nothing streamed yet
+            [json.dumps({"type": "end"})],  # worker finished on the next poll
+        ]
+
+        with (
+            patch(
+                "backend.main.redis.get", new_callable=AsyncMock, return_value=b"pending"
+            ),
+            patch(
+                "backend.main.redis.lrange",
+                new_callable=AsyncMock,
+                side_effect=lrange_results,
+            ),
+            patch("backend.main.redis.pubsub", return_value=pubsub),
+            TestClient(app) as client,
+            client.websocket_connect("/ws/session/test-session") as ws,
+        ):
+                assert ws.receive_json() == {"type": "end"}
+        pubsub.get_message.assert_awaited()
+
+    def test_closes_when_no_job_and_empty_buffer(self):
+        pubsub = self._build_pubsub_mock()
+
+        with (
+            patch(
+                "backend.main.redis.get", new_callable=AsyncMock, return_value=None
+            ),
+            patch(
+                "backend.main.redis.lrange",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch("backend.main.redis.pubsub", return_value=pubsub),
+            TestClient(app) as client,
+            client.websocket_connect("/ws/session/test-session") as ws,
+        ):
+                assert ws.receive_json() == {"type": "end"}
+
+    def test_stop_at_end_frame_does_not_send_more(self):
+        from starlette.websockets import WebSocketDisconnect
+
+        # Two frames buffered with an end first — nothing after the end is sent.
+        pubsub = self._build_pubsub_mock()
+        frames = [
+            json.dumps({"type": "end"}),
+            json.dumps({"type": "chat", "content": "dropped"}),
+        ]
+
+        with (
+            patch(
+                "backend.main.redis.get", new_callable=AsyncMock, return_value=None
+            ),
+            patch(
+                "backend.main.redis.lrange",
+                new_callable=AsyncMock,
+                return_value=frames,
+            ),
+            patch("backend.main.redis.pubsub", return_value=pubsub),
+            TestClient(app) as client,
+            client.websocket_connect("/ws/session/test-session") as ws,
+        ):
+                assert ws.receive_json() == {"type": "end"}
+                with pytest.raises(WebSocketDisconnect):
+                    ws.receive_json()
 
 
 # ── WebSocket disconnect handling ────────────────────────────

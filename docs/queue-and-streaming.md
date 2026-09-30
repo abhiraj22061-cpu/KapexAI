@@ -1,8 +1,8 @@
 # Queue & Streaming
 
 This document explains how the backend enqueues jobs and streams results back to
-the frontend via Redis. For the agentic side (router, tools, message log, state)
-see [agentic-pipeline.md](agentic-pipeline.md).
+the frontend via Redis. For the agentic side (orchestrator, subagents, message
+log, state) see [agentic-pipeline.md](agentic-pipeline.md).
 
 ## Flow overview
 
@@ -11,22 +11,24 @@ Frontend                    Backend                      Worker
    │                          │                           │
    │  POST /create_chat_session                            │
    │─────────────────────────►│                           │
-   │                          │  1. Create Session (DB)   │
-   │                          │  2. LPUSH jobs:queue      │
-   │                          │     + SET pending:{id}    │
-   │  { session_id, job_id }  │──────────────────────────►│
-   │◄─────────────────────────│  3. BRPOP jobs:queue      │
-   │                          │                           │
-   │  WS /ws/session/{id}     │                           │
-   │════════════════════════►│                           │
-   │                          │  4. Run langgraph graph   │
-   │                          │  5. PUBLISH stream:{id}   │
-   │◄═════════════════════════│◄──────────────────────────│
-   │   { type: "chat" }       │   (via redis.publish)     │
-   │◄═════════════════════════│◄──────────────────────────│
-   │   { type: "suggestions" }│                           │
-   │◄═════════════════════════│◄──────────────────────────│
-   │   { type: "end" }        │                           │
+    │                          │  1. Create Session (DB)   │
+    │                          │  2. SET pending:{id}      │
+    │                          │     (clear old frames)    │
+    │                          │     + LPUSH jobs:queue    │
+    │  { session_id, job_id }  │──────────────────────────►│
+    │◄─────────────────────────│  3. BRPOP jobs:queue      │
+    │                          │                           │
+    │  WS /ws/session/{id}     │                           │
+    │════════════════════════►│                           │
+    │                          │  4. Run orchestrator turn │
+    │                          │  5. RPUSH stream:{id}:frames
+    │                          │     + PUBLISH stream:{id} │
+    │◄═════════════════════════│◄──────────────────────────│
+    │   { type: "chat" }       │   (list = source of truth,│
+    │◄═════════════════════════│    publish = wakeup)      │
+    │   { type: "suggestions" }│                           │
+    │◄═════════════════════════│◄──────────────────────────│
+    │   { type: "end" }        │                           │
 ```
 
 ## Job queue (`jobs:queue`)
@@ -54,10 +56,13 @@ instead of free text, so the worker can map the answers onto the questions by
 key without LLM parsing (see `docs/questionnaire-tool.md`).
 
 Every enqueue also records the in-flight message so other tabs can surface it:
-the backend calls `mark_pending(session_id, content, type)`, which sets
-`pending:{session_id}` in Redis (5-min TTL) and flips `Session.status` to
-`PENDING`. The worker clears the key and sets the status back to `ACTIVE` (or
-`FAILED`) once the job finishes — see [In-flight tracking](#in-flight-tracking) below.
+the backend calls `mark_pending(session_id, content, type)` **before** the
+`LPUSH` — so the worker can never finish (and clear the marker) before it was
+set. `mark_pending` writes `pending:{session_id}` in Redis (5-min TTL), clears
+the previous turn's `stream:{session_id}:frames` buffer and flips
+`Session.status` to `PENDING`. The worker clears the key and sets the status
+back to `ACTIVE` (or `FAILED`) once the job finishes — see
+[In-flight tracking](#in-flight-tracking) below.
 
 ### Worker — dequeue
 
@@ -106,22 +111,30 @@ The WebSocket forwards it to the frontend. Both backend endpoints return the
 
 ## Streaming results (`stream:{session_id}`)
 
-The worker publishes to the session's pub/sub channel. The backend WebSocket
-(`/ws/session/{session_id}`) subscribes and forwards each frame to the frontend.
+Each frame is written twice by the worker (`worker/helpers/events.py`):
 
-The endpoint is intentionally connection-safe:
+- **`RPUSH stream:{session_id}:frames`** — a per-turn Redis list (5-min TTL,
+  cleared by `mark_pending` when the next turn starts). This is the source of
+  truth.
+- **`PUBLISH stream:{session_id}`** — a wakeup for anyone already listening.
 
-- If no job is in flight (`pending:{session_id}` is absent), it sends `end` and
-  closes immediately rather than holding an idle socket.
-- While waiting for frames it polls the marker every 10s, so it also closes if
-  the job finishes before publishing anything.
+The backend WebSocket (`/ws/session/{session_id}`) **tails the list** with a
+cursor and treats the pub/sub message only as a "read again" signal:
+
+- It replays every frame from the cursor, so a client that connects *after* a
+  fast turn already finished — or between two frames during a reconnect —
+  still receives the whole reply instead of losing it (bare pub/sub would have
+  dropped those messages).
+- When the buffer is drained and `pending:{session_id}` is absent, it sends
+  `end` and closes; while a job is still running it waits on the wakeup
+  (1s poll fallback).
 - Every send goes through a `_safe_send` helper that treats a client that
   disconnected mid-stream (e.g. a tab that was closed) as a normal close, so it
   never crashes the endpoint.
 
 ### Message protocol
 
-Each message published to `stream:{session_id}` is a JSON string:
+Each frame streamed on `stream:{session_id}` is a JSON string:
 
 | `type` | Payload | Description |
 |---|---|---|
@@ -164,26 +177,31 @@ that the assistant is still working, the backend keeps a lightweight marker:
 - **The worker clears it** in `process_job`: on success it deletes the key and
   marks the session `ACTIVE`; on failure it deletes the key and marks it
   `FAILED`.
-- **The WebSocket** uses the marker to avoid dangling connections: if
-  `pending:{session_id}` is absent at connect time it sends `end` and closes
-  immediately, and while idle it polls the marker every 10s so it also closes
-  once a job finishes without ever having streamed.
+- **The WebSocket** no longer uses the marker to decide whether to connect: it
+  always drains `stream:{session_id}:frames` (replaying a turn that finished
+  between the POST and the socket opening), and only sends `end` + closes once
+  the buffer is drained *and* the marker is absent.
 
 Frontend behavior: when `GET /get_messages` returns a non-null `pending`, the
 tab appends the optimistic user bubble (flagged `pending: true`), shows the
 typing indicator, and connects the WebSocket to receive the result live. Sending
 is blocked while `streaming` is true, so a busy session never gets a second
-message injected mid-turn from another tab.
+message injected mid-turn from another tab. If a turn ends (`end` frame)
+without a single content frame having arrived on that socket, the tab
+re-fetches `GET /get_messages` — the safety net that clears the optimistic
+bubble and shows the reply from the DB when frames were lost entirely.
 
 ## Key considerations
 
-- **Pub/sub is fire-and-forget** — if no WebSocket is connected, published
-  messages are lost; the `Message` table is the durable record. The
-  `pending:{session_id}` marker (see above) lets tabs catch up live while a job
-  is in flight.
-- **One channel per session** — `stream:{session_id}` is unique per session.
-  Multiple open tabs each connect their own WebSocket and receive the same
-  frames; the frontend closes stale sockets before opening a new stream.
+- **Frames are buffered, then replayed** — pub/sub alone is fire-and-forget
+  (published messages are lost when nobody is subscribed, e.g. the milliseconds
+  between the POST returning and the socket opening). The
+  `stream:{session_id}:frames` list covers that window for 5 minutes; the
+  `Message` table remains the durable record beyond it.
+- **One channel per session** — `stream:{session_id}` (and its `:frames` list)
+  are unique per session. Multiple open tabs each connect their own WebSocket
+  and independently replay/tail the same list; the frontend closes stale
+  sockets before opening a new stream.
 - **State persistence** — the state is stored at `langgraph_state:{session_id}`
   (24h TTL). If it's gone, the worker rebuilds the message log from the DB, so
   the conversation resumes instead of restarting.

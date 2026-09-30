@@ -1,4 +1,4 @@
-"""Focused regression tests for `QuestionnaireTool._is_real_idea`.
+"""Focused regression tests for `QuestionnaireAgent._is_real_idea`.
 
 The classifier decides whether a user's first message is a real business idea
 versus a questionnaire command, greeting, or gibberish. It must accept short
@@ -12,11 +12,11 @@ from types import SimpleNamespace
 
 from conftest import run as _run
 
-from worker.tools.questionnaire_tool import QuestionnaireTool
+from worker.agents.questionnaire_agent import QuestionnaireAgent
 
 
 def _idea(text):
-    tool = QuestionnaireTool()
+    tool = QuestionnaireAgent()
     return _run(tool._is_real_idea(text))
 
 
@@ -121,7 +121,7 @@ def test_llm_parse_hiccup_accepts(monkeypatch):
     """A malformed LLM response in the ambiguous middle must not reject a
     plausible idea — it accepts, so the questionnaire can proceed."""
     monkeypatch.setattr(
-        "worker.tools.questionnaire_tool.IS_IDEA_TEMPLATE",
+        "worker.agents.questionnaire_agent.IS_IDEA_TEMPLATE",
         _FakeTemplate("not json at all"),
     )
     assert _idea(AMBIGUOUS)
@@ -129,7 +129,7 @@ def test_llm_parse_hiccup_accepts(monkeypatch):
 
 def test_llm_valid_rejection_is_honoured(monkeypatch):
     monkeypatch.setattr(
-        "worker.tools.questionnaire_tool.IS_IDEA_TEMPLATE",
+        "worker.agents.questionnaire_agent.IS_IDEA_TEMPLATE",
         _FakeTemplate('{"real_idea": false}'),
     )
     assert not _idea(AMBIGUOUS)
@@ -137,7 +137,7 @@ def test_llm_valid_rejection_is_honoured(monkeypatch):
 
 def test_llm_valid_acceptance_is_honoured(monkeypatch):
     monkeypatch.setattr(
-        "worker.tools.questionnaire_tool.IS_IDEA_TEMPLATE",
+        "worker.agents.questionnaire_agent.IS_IDEA_TEMPLATE",
         _FakeTemplate('{"real_idea": true}'),
     )
     assert _idea(AMBIGUOUS)

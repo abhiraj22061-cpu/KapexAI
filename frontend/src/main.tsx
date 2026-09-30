@@ -5,6 +5,7 @@ import App from './App'
 import { AuthProvider } from './lib/auth'
 import './styles/global.css'
 import './styles/chat.css'
+import './styles/dashboard.css'
 
 const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID
 

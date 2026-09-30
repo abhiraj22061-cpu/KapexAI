@@ -45,8 +45,14 @@ export function Sidebar({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draftName, setDraftName] = useState('')
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const cancelEditRef = useRef(false)
   const navigate = useNavigate()
+
+  // Keep the active conversation's dashboard list open (accordion-style).
+  useEffect(() => {
+    setExpandedId(activeSessionId)
+  }, [activeSessionId])
 
   const closeMenu = () => {
     setMenu(null)
@@ -130,32 +136,75 @@ export function Sidebar({
                 />
               </div>
             ) : (
-              <div
-                key={session.id}
-                className={`session-item${session.id === activeSessionId ? ' active' : ''}`}
-              >
-                <button
-                  type="button"
-                  className="session-main"
-                  onClick={() => {
-                    onSelect(session.id)
-                    onClose?.()
-                  }}
-                  title={session.business_idea}
+              <div key={session.id} className="session-group">
+                <div
+                  className={`session-item${session.id === activeSessionId ? ' active' : ''}`}
                 >
-                  <span className="session-icon" aria-hidden="true">
-                    ✦
-                  </span>
-                  <span className="session-title">{session.business_idea || 'Untitled chat'}</span>
-                </button>
-                <button
-                  type="button"
-                  className="session-menu-btn"
-                  aria-label={`Options for ${session.business_idea || 'Untitled chat'}`}
-                  onClick={(e) => openMenu(e, session.id)}
-                >
-                  <span aria-hidden="true">⋯</span>
-                </button>
+                  <button
+                    type="button"
+                    className="session-main"
+                    onClick={() => {
+                      onSelect(session.id)
+                      onClose?.()
+                    }}
+                    title={session.business_idea}
+                  >
+                    <span className="session-icon" aria-hidden="true">
+                      ✦
+                    </span>
+                    <span className="session-title">{session.business_idea || 'Untitled chat'}</span>
+                  </button>
+                  {session.dashboards.length > 0 ? (
+                    <button
+                      type="button"
+                      className="session-dash-toggle"
+                      aria-label={`Dashboards for ${session.business_idea || 'Untitled chat'}`}
+                      aria-expanded={expandedId === session.id}
+                      onClick={() =>
+                        setExpandedId(expandedId === session.id ? null : session.id)
+                      }
+                    >
+                      <span
+                        className={`dash-caret${expandedId === session.id ? ' open' : ''}`}
+                        aria-hidden="true"
+                      >
+                        ▸
+                      </span>
+                      {session.dashboards.length}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="session-menu-btn"
+                    aria-label={`Options for ${session.business_idea || 'Untitled chat'}`}
+                    onClick={(e) => openMenu(e, session.id)}
+                  >
+                    <span aria-hidden="true">⋯</span>
+                  </button>
+                </div>
+                {session.dashboards.length > 0 && expandedId === session.id ? (
+                  <ul className="session-dash-list">
+                    {session.dashboards.map((dash) => (
+                      <li key={dash.id}>
+                        <button
+                          type="button"
+                          title={dash.name}
+                          onClick={() => {
+                            navigate(
+                              `/chat/${session.id}/dashboard/${dash.id}`,
+                            )
+                            onClose?.()
+                          }}
+                        >
+                          <span className="dash-icon" aria-hidden="true">
+                            ▦
+                          </span>
+                          <span className="dash-name">{dash.name}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
               </div>
             ),
           )}

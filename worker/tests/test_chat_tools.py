@@ -4,14 +4,16 @@ import pytest
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from conftest import run as _run
+from conftest import llm_plan_from, make_ctx, run as _run
 from db_service import db
 from langchain_core.runnables import RunnableLambda
 from redis_service import redis
 
-from worker.agent import build_graph, load_state, process_job
+from worker.agent import load_state, process_job
+from worker.orchestrator import Orchestrator
+from worker.orchestrator.planner import Planner
+from worker.agents.base import AgentResult
 from worker.agents.chat_agent import ChatAgent
-from worker.agents.router_agent import RouterAgent
 from worker.helpers.messages import (
     business_context,
     business_profile,
@@ -19,13 +21,13 @@ from worker.helpers.messages import (
     inject_business_profile,
     questionnaire_pending,
 )
+from worker.orchestrator.composer import assistant_card
 from worker.helpers.persistence import add_message, build_state_from_db
-from worker.tools.economics_tool import EconomicsTool
-from worker.tools.foresight_tool import ForesightTool, future_signpost_matrix
-from worker.tools.indian_finance_tool import IndianFinanceTool
-from worker.tools.questionnaire_tool import QuestionnaireTool
-from worker.tools.swot_tool import SwotTool
-from worker.tools.web_search_tool import WebSearchTool
+from worker.agents.economics_agent import EconomicsAgent
+from worker.agents.foresight_agent import ForesightAgent, future_signpost_matrix
+from worker.agents.questionnaire_agent import QuestionnaireAgent
+from worker.agents.swot_agent import SwotAgent
+from worker.agents.web_search_agent import WebSearchAgent
 
 TEST_EMAIL = "chat-tools-test@example.com"
 TEST_IDEA = (
@@ -107,16 +109,42 @@ def test_redis_queue_and_pubsub():
     _run(scenario())
 
 
+def test_publish_stream_buffers_frames_for_replay():
+    """Every streamed frame is also appended to a Redis list — the backend
+    WebSocket replays it, so frames published while no socket was subscribed
+    (the connect race after a fast turn) are never lost."""
+    async def scenario():
+        from worker.helpers.events import publish_stream
+
+        sid = "events-buffer-test-session"
+        key = f"stream:{sid}:frames"
+        await redis.delete(key)
+
+        await publish_stream(sid, {"type": "chat", "content": "hello"})
+        await publish_stream(sid, {"type": "end"})
+
+        buffered = await redis.lrange(key, 0, -1)
+        assert [json.loads(raw) for raw in buffered] == [
+            {"type": "chat", "content": "hello"},
+            {"type": "end"},
+        ]
+        assert await redis.ttl(key) > 0
+
+        await redis.delete(key)
+
+    _run(scenario())
+
+
 def test_chat_flow_persists_and_streams(monkeypatch):
     """Chat replies are persisted and streamed, and once the questionnaire is
     completed the turn ends with a `suggestions` event listing the tools."""
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "chat", "tool": None}
 
-    async def fake_chat(self, user_input, transcript, context, tools):
+    async def fake_chat(self, user_input, transcript, context, tools, notes=""):
         return "FAKE CHAT REPLY"
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     monkeypatch.setattr(ChatAgent, "run", fake_chat)
 
     async def scenario():
@@ -127,10 +155,10 @@ def test_chat_flow_persists_and_streams(monkeypatch):
         await add_message(sid, "ASSISTANT", "TOOL",
                           {"type": "questionnaire_complete", "content": "done",
                            "context": {"business_about": TEST_IDEA}})
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            result = await process_job({"session_id": sid, "user_input": "Hello"}, graph)
+            result = await process_job({"session_id": sid, "user_input": "Hello"}, engine)
             events = await _collect(ps, 3)
 
             types = [m["type"] for m in result["messages"]]
@@ -170,19 +198,19 @@ def test_first_message_greeting_goes_to_chat(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "chat", "tool": None}
 
-    async def fake_chat(self, user_input, transcript, context, tools):
+    async def fake_chat(self, user_input, transcript, context, tools, notes=""):
         return "Hi! I'm KapexAI, your business consultant. How can I help your business?"
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     monkeypatch.setattr(ChatAgent, "run", fake_chat)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            result = await process_job({"session_id": sid, "user_input": "hi"}, graph)
+            result = await process_job({"session_id": sid, "user_input": "hi"}, engine)
             events = await _collect(ps, 2)
 
             assert [m["type"] for m in result["messages"]] == ["chat", "chat"]
@@ -232,24 +260,24 @@ def test_questionnaire_rejects_nonsense_answers(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
-    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
-    monkeypatch.setattr(QuestionnaireTool, "_is_clarification", fake_is_clarification)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireAgent, "_parse", fake_parse)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_clarification", fake_is_clarification)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, engine)
             await _collect(ps, 3)
 
             second = await process_job(
-                {"session_id": sid, "user_input": "bla bal ....."}, graph
+                {"session_id": sid, "user_input": "bla bal ....."}, engine
             )
             await _collect(ps, 3)
 
@@ -269,7 +297,7 @@ def test_questionnaire_rejects_nonsense_answers(monkeypatch):
 
             # Questionnaire still pending → a real answer next completes it.
             third = await process_job(
-                {"session_id": sid, "user_input": "Young professionals in Pune"}, graph
+                {"session_id": sid, "user_input": "Young professionals in Pune"}, engine
             )
             await _collect(ps, 3)
             assert third["messages"][-1]["type"] == "questionnaire_complete"
@@ -335,26 +363,26 @@ def test_questionnaire_answers_clarifying_question(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
-    monkeypatch.setattr(QuestionnaireTool, "_is_clarification", fake_is_clarification)
-    monkeypatch.setattr(QuestionnaireTool, "_explain", fake_explain)
-    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_clarification", fake_is_clarification)
+    monkeypatch.setattr(QuestionnaireAgent, "_explain", fake_explain)
+    monkeypatch.setattr(QuestionnaireAgent, "_parse", fake_parse)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, engine)
             await _collect(ps, 3)
 
             second = await process_job(
                 {"session_id": sid, "user_input": "1) can you explain this in clear words.."},
-                graph,
+                engine,
             )
             await _collect(ps, 2)
 
@@ -370,7 +398,7 @@ def test_questionnaire_answers_clarifying_question(monkeypatch):
 
             # A real answer on the next turn completes the questionnaire.
             third = await process_job(
-                {"session_id": sid, "user_input": "Young professionals in Pune"}, graph
+                {"session_id": sid, "user_input": "Young professionals in Pune"}, engine
             )
             await _collect(ps, 3)
             assert third["messages"][-1]["type"] == "questionnaire_complete"
@@ -421,28 +449,28 @@ def test_questionnaire_structured_clarification_explains(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_explain", fake_explain)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_explain", fake_explain)
     monkeypatch.setattr(
-        QuestionnaireTool, "_validate_structured", fake_validate_structured
+        QuestionnaireAgent, "_validate_structured", fake_validate_structured
     )
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, engine)
             await _collect(ps, 3)
 
             payload = json.dumps(
                 {"kind": "questionnaire_clarification", "keys": ["q2"]}
             )
             second = await process_job(
-                {"session_id": sid, "user_input": payload}, graph
+                {"session_id": sid, "user_input": payload}, engine
             )
             await _collect(ps, 2)
 
@@ -465,7 +493,7 @@ def test_questionnaire_structured_clarification_explains(monkeypatch):
                 }
             )
             third = await process_job(
-                {"session_id": sid, "user_input": answers_payload}, graph
+                {"session_id": sid, "user_input": answers_payload}, engine
             )
             await _collect(ps, 2)
             assert third["messages"][-1]["type"] == "questionnaire_complete"
@@ -492,19 +520,19 @@ def test_questionnaire_asks_for_idea_when_trigger_phrase(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
                 {"session_id": sid, "user_input": "Start the business questionnaire"},
-                graph,
+                engine,
             )
             await _collect(ps, 2)
 
@@ -544,20 +572,20 @@ def test_questionnaire_starts_for_short_idea(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     # NOTE: `_is_real_idea` is deliberately NOT patched — the real (now
     # deterministic) logic must accept "south indian restaurant in pune".
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
                 {"session_id": sid, "user_input": "south indian restaurant in pune"},
-                graph,
+                engine,
             )
             await _collect(ps, 2)
 
@@ -597,16 +625,16 @@ def test_questionnaire_ui_sequence_no_idea_repeat(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
-    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireAgent, "_parse", fake_parse)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     # `_is_real_idea` is again NOT patched — the real logic must accept both.
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             first = await process_job(
@@ -614,7 +642,7 @@ def test_questionnaire_ui_sequence_no_idea_repeat(monkeypatch):
                     "session_id": sid,
                     "user_input": "hi i want to open south indian business in pune",
                 },
-                graph,
+                engine,
             )
             await _collect(ps, 2)
             assert [m["type"] for m in first["messages"]] == [
@@ -624,7 +652,7 @@ def test_questionnaire_ui_sequence_no_idea_repeat(monkeypatch):
 
             second = await process_job(
                 {"session_id": sid, "user_input": "south indian restaurant in pune"},
-                graph,
+                engine,
             )
             await _collect(ps, 2)
             second_types = [m["type"] for m in second["messages"]]
@@ -661,20 +689,20 @@ def test_questionnaire_auto_starts_then_collects(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
-    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_parse", fake_parse)
+    monkeypatch.setattr(QuestionnaireAgent, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             first = await process_job(
-                {"session_id": sid, "user_input": TEST_IDEA}, graph
+                {"session_id": sid, "user_input": TEST_IDEA}, engine
             )
             events1 = await _collect(ps, 3)
 
@@ -689,7 +717,7 @@ def test_questionnaire_auto_starts_then_collects(monkeypatch):
 
             second = await process_job(
                 {"session_id": sid, "user_input": "Young professionals. Self-funded."},
-                graph,
+                engine,
             )
             events2 = await _collect(ps, 3)
 
@@ -745,22 +773,22 @@ def test_questionnaire_structured_answers_bypass_parsing(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(QuestionnaireTool, "_validate", fake_validate)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_validate", fake_validate)
     monkeypatch.setattr(
-        QuestionnaireTool, "_validate_structured", fake_validate_structured
+        QuestionnaireAgent, "_validate_structured", fake_validate_structured
     )
-    monkeypatch.setattr(QuestionnaireTool, "_parse", fake_parse)
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(QuestionnaireAgent, "_parse", fake_parse)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, engine)
             await _collect(ps, 3)
 
             payload = json.dumps(
@@ -774,7 +802,7 @@ def test_questionnaire_structured_answers_bypass_parsing(monkeypatch):
                 }
             )
             second = await process_job(
-                {"session_id": sid, "user_input": payload}, graph
+                {"session_id": sid, "user_input": payload}, engine
             )
             events = await _collect(ps, 3)
 
@@ -850,20 +878,20 @@ def test_questionnaire_structured_garbage_answers_rejected(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
     monkeypatch.setattr(
-        QuestionnaireTool, "_validate_structured", fake_validate_structured
+        QuestionnaireAgent, "_validate_structured", fake_validate_structured
     )
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, engine)
             await _collect(ps, 3)
 
             payload = json.dumps(
@@ -877,7 +905,7 @@ def test_questionnaire_structured_garbage_answers_rejected(monkeypatch):
                 }
             )
             second = await process_job(
-                {"session_id": sid, "user_input": payload}, graph
+                {"session_id": sid, "user_input": payload}, engine
             )
             events = await _collect(ps, 2)
 
@@ -935,20 +963,20 @@ def test_questionnaire_structured_partial_garbage_keeps_valid(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "questionnaire"}
 
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
     monkeypatch.setattr(
-        QuestionnaireTool, "_validate_structured", fake_validate_structured
+        QuestionnaireAgent, "_validate_structured", fake_validate_structured
     )
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": TEST_IDEA}, graph)
+            await process_job({"session_id": sid, "user_input": TEST_IDEA}, engine)
             await _collect(ps, 3)
 
             payload = json.dumps(
@@ -962,7 +990,7 @@ def test_questionnaire_structured_partial_garbage_keeps_valid(monkeypatch):
                 }
             )
             second = await process_job(
-                {"session_id": sid, "user_input": payload}, graph
+                {"session_id": sid, "user_input": payload}, engine
             )
             await _collect(ps, 2)
 
@@ -989,14 +1017,11 @@ def test_tool_flow_routes_and_streams(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "web_search"}
 
-    def fake_search_run(self, state):
-        return [
-            {"role": "USER", "agent": "TOOL", "type": "research_request", "content": "q"},
-            {"role": "ASSISTANT", "agent": "TOOL", "type": "research", "content": "FAKE RESEARCH"},
-        ]
+    def fake_search_run(self, query, ctx):
+        return AgentResult(text="FAKE RESEARCH", message_type="research")
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(WebSearchTool, "run", fake_search_run)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(WebSearchAgent, "run", fake_search_run)
 
     async def scenario():
         session = await _make_session()
@@ -1016,11 +1041,11 @@ def test_tool_flow_routes_and_streams(monkeypatch):
             sid, "ASSISTANT", "TOOL",
             {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
         )
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "search competitors"}, graph
+                {"session_id": sid, "user_input": "search competitors"}, engine
             )
             events = await _collect(ps, 3)
 
@@ -1032,7 +1057,7 @@ def test_tool_flow_routes_and_streams(monkeypatch):
 
             msgs = await db.message.find_many(where={"sessionId": sid})
             assert sorted(m.agent for m in msgs) == [
-                "CHAT", "TOOL", "TOOL", "TOOL", "TOOL", "TOOL", "TOOL",
+                "CHAT", "CHAT", "TOOL", "TOOL", "TOOL", "TOOL", "TOOL",
             ]
 
             await ps.unsubscribe(f"stream:{sid}")
@@ -1059,24 +1084,24 @@ def test_context_tools_gated_until_questionnaire_complete(monkeypatch):
             "questions": [{"key": "q1", "question": "Who is your target customer?"}],
         }
 
-    async def fake_swot_run(self, state):
+    async def fake_swot_run(self, query, ctx):
         raise AssertionError("swot must not run before the questionnaire is completed")
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(SwotTool, "run", fake_swot_run)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(SwotAgent, "run", fake_swot_run)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         request = "Run a SWOT analysis for my business"
         try:
             result = await process_job(
                 {"session_id": sid, "user_input": request},
-                graph,
+                engine,
             )
             await _collect(ps, 3)
 
@@ -1101,14 +1126,11 @@ def test_context_tool_runs_after_questionnaire_complete(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "swot"}
 
-    async def fake_swot_run(self, state):
-        return [
-            {"role": "USER", "agent": "TOOL", "type": "swot_request", "content": "req"},
-            {"role": "ASSISTANT", "agent": "TOOL", "type": "swot", "content": "FAKE SWOT", "sections": {}},
-        ]
+    async def fake_swot_run(self, query, ctx):
+        return AgentResult(text="FAKE SWOT", data={"sections": {}}, message_type="swot")
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(SwotTool, "run", fake_swot_run)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(SwotAgent, "run", fake_swot_run)
 
     async def scenario():
         session = await _make_session()
@@ -1126,11 +1148,11 @@ def test_context_tool_runs_after_questionnaire_complete(monkeypatch):
             sid, "ASSISTANT", "TOOL",
             {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
         )
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "Run a SWOT analysis"}, graph
+                {"session_id": sid, "user_input": "Run a SWOT analysis"}, engine
             )
             events = await _collect(ps, 3)
 
@@ -1172,24 +1194,22 @@ def test_swot_tool_includes_message_history(monkeypatch):
             )
         )
 
-    tool = SwotTool()
+    tool = SwotAgent()
     tool.llm = RunnableLambda(fake_llm)
     monkeypatch.setattr(
-        "worker.tools.swot_tool.SWOT_TEMPLATE", RunnableLambda(fake_template)
+        "worker.agents.swot_agent.SWOT_TEMPLATE", RunnableLambda(fake_template)
     )
 
     async def scenario():
-        entries = await tool.run(
-            {
-                "session_id": "s",
-                "user_input": "Run a SWOT analysis",
-                "messages": [
-                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to sell dried mangoes in Pune."},
-                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "dried mangoes", "business_location": "Pune"}},
-                ],
-            }
+        ctx = make_ctx(
+            request="Run a SWOT analysis",
+            messages=[
+                {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to sell dried mangoes in Pune."},
+                {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "dried mangoes", "business_location": "Pune"}},
+            ],
         )
-        assert entries[1]["type"] == "swot"
+        msg = assistant_card(await tool.run(ctx.user_input, ctx))
+        assert msg["type"] == "swot"
         # The transcript (message history) reached the prompt.
         assert captured["inputs"]["transcript"] == (
             "USER (chat): I plan to sell dried mangoes in Pune.\n"
@@ -1211,22 +1231,20 @@ def test_web_search_tool_includes_message_history():
             captured["messages"] = payload["messages"]
             return {"messages": [SimpleNamespace(content="FINAL RESEARCH SUMMARY")]}
 
-    tool = WebSearchTool()
+    tool = WebSearchAgent()
     tool.agent = FakeAgent()
 
     async def scenario():
-        entries = tool.run(
-            {
-                "session_id": "s",
-                "user_input": "Who are my top competitors?",
-                "messages": [
-                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to sell dried mangoes in Pune."},
-                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "dried mangoes", "business_location": "Pune"}},
-                ],
-            }
+        ctx = make_ctx(
+            request="Who are my top competitors?",
+            messages=[
+                {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to sell dried mangoes in Pune."},
+                {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "dried mangoes", "business_location": "Pune"}},
+            ],
         )
-        assert entries[1]["type"] == "research"
-        assert entries[1]["content"] == "FINAL RESEARCH SUMMARY"
+        msg = assistant_card(tool.run(ctx.user_input, ctx))
+        assert msg["type"] == "research"
+        assert msg["content"] == "FINAL RESEARCH SUMMARY"
 
         system, human = captured["messages"]
         assert system.type == "system"
@@ -1241,21 +1259,21 @@ def test_unknown_tool_falls_back_to_chat(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "tool", "tool": "does_not_exist"}
 
-    async def fake_chat(self, user_input, transcript, context, tools):
+    async def fake_chat(self, user_input, transcript, context, tools, notes=""):
         return "FAKE CHAT REPLY"
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     monkeypatch.setattr(ChatAgent, "run", fake_chat)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
         await add_message(sid, "USER", "CHAT", {"type": "chat", "content": "seed"})
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "do the impossible"}, graph
+                {"session_id": sid, "user_input": "do the impossible"}, engine
             )
             events = await _collect(ps, 3)
             assert events[0]["type"] == "chat"
@@ -1346,25 +1364,25 @@ def test_business_profile_injected_into_state_and_context(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "chat", "tool": None}
 
-    async def fake_chat(self, user_input, transcript, context, tools):
+    async def fake_chat(self, user_input, transcript, context, tools, notes=""):
         assert "Cafe Pune" in transcript
         assert context["business_profile"]["location"] == "Pune"
         return "Thanks!"
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     monkeypatch.setattr(ChatAgent, "run", fake_chat)
 
     async def scenario():
         session = await _make_profile_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             # Seed a completed questionnaire so suggestions are streamed too.
             await add_message(sid, "ASSISTANT", "TOOL",
                               {"type": "questionnaire_complete", "content": "done",
                                "context": {"business_about": TEST_IDEA}})
-            result = await process_job({"session_id": sid, "user_input": "hi"}, graph)
+            result = await process_job({"session_id": sid, "user_input": "hi"}, engine)
             await _collect(ps, 3)
 
             types = [m["type"] for m in result["messages"]]
@@ -1390,10 +1408,10 @@ def test_business_profile_updates_reflect_on_next_job(monkeypatch):
     async def fake_classify(self, user_input, messages, tools):
         return {"intent": "chat", "tool": None}
 
-    async def fake_chat(self, user_input, transcript, context, tools):
+    async def fake_chat(self, user_input, transcript, context, tools, notes=""):
         return "ok"
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
     monkeypatch.setattr(ChatAgent, "run", fake_chat)
 
     async def scenario():
@@ -1401,10 +1419,10 @@ def test_business_profile_updates_reflect_on_next_job(monkeypatch):
 
         session = await _make_profile_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
-            await process_job({"session_id": sid, "user_input": "hi"}, graph)
+            await process_job({"session_id": sid, "user_input": "hi"}, engine)
             await _collect(ps, 2)
 
             await db.businessprofile.update(
@@ -1417,7 +1435,7 @@ def test_business_profile_updates_reflect_on_next_job(monkeypatch):
             )
 
             result = await process_job(
-                {"session_id": sid, "user_input": "hi again"}, graph
+                {"session_id": sid, "user_input": "hi again"}, engine
             )
             await _collect(ps, 2)
 
@@ -1466,11 +1484,11 @@ def test_economics_tool_routes_and_streams(monkeypatch):
         assert "GDP (current US$)" in str(raw)
         return "India's GDP was steady at ~3.5-3.8 in recent years."
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
-    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(EconomicsAgent, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsAgent, "_summarize", fake_summarize)
     monkeypatch.setattr(
-        "worker.tools.economics_tool.fetch_world_bank_indicator", fake_fetch
+        "worker.agents.economics_agent.fetch_world_bank_indicator", fake_fetch
     )
 
     async def scenario():
@@ -1489,15 +1507,16 @@ def test_economics_tool_routes_and_streams(monkeypatch):
             sid, "ASSISTANT", "TOOL",
             {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
         )
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "India's GDP growth"}, graph
+                {"session_id": sid, "user_input": "India's GDP growth"}, engine
             )
             events = await _collect(ps, 3)
 
-            assert result["messages"][-2]["type"] == "economics_request"
+            assert result["messages"][-2]["type"] == "chat"  # composer's USER echo
+            assert result["messages"][-2]["role"] == "USER"
             assert result["messages"][-1]["type"] == "economics"
             assert result["messages"][-1]["content"] == (
                 "India's GDP was steady at ~3.5-3.8 in recent years."
@@ -1515,7 +1534,7 @@ def test_economics_tool_routes_and_streams(monkeypatch):
             assert events[2]["type"] == "end"
 
             msgs = await db.message.find_many(where={"sessionId": sid})
-            assert [m.agent for m in msgs].count("TOOL") == 6
+            assert [m.agent for m in msgs].count("TOOL") == 5
 
             await ps.unsubscribe(f"stream:{sid}")
             await ps.close()
@@ -1540,23 +1559,23 @@ def test_economics_gated_until_questionnaire_complete(monkeypatch):
             "questions": [{"key": "q1", "question": "Who is your target customer?"}],
         }
 
-    async def fake_econ_run(self, state):
+    async def fake_econ_run(self, query, ctx):
         raise AssertionError("economics must not run before the questionnaire is completed")
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(EconomicsTool, "run", fake_econ_run)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsAgent, "run", fake_econ_run)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         request = "India's GDP growth"
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": request}, graph
+                {"session_id": sid, "user_input": request}, engine
             )
             await _collect(ps, 3)
 
@@ -1602,28 +1621,25 @@ def test_economics_tool_includes_history_and_data(monkeypatch):
         captured["summarize"] = {"request": request, "raw": raw}
         return "The INR has been around 0.012 USD."
 
-    tool = EconomicsTool()
-    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
-    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    tool = EconomicsAgent()
+    monkeypatch.setattr(EconomicsAgent, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsAgent, "_summarize", fake_summarize)
     monkeypatch.setattr(
-        "worker.tools.economics_tool.fetch_exchange_rate_series", fake_fetch
+        "worker.agents.economics_agent.fetch_exchange_rate_series", fake_fetch
     )
 
     async def scenario():
-        entries = await tool.run(
-            {
-                "session_id": "s",
-                "user_input": "How has the INR to USD rate moved?",
-                "messages": [
-                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to import goods from the US."},
-                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "importing goods"}},
-                ],
-            }
+        ctx = make_ctx(
+            request="How has the INR to USD rate moved?",
+            messages=[
+                {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to import goods from the US."},
+                {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "importing goods"}},
+            ],
         )
-        assert entries[0]["type"] == "economics_request"
-        assert entries[1]["type"] == "economics"
-        assert entries[1]["content"] == "The INR has been around 0.012 USD."
-        assert entries[1]["source"] == "https://api.frankfurter.dev/v2/rates"
+        msg = assistant_card(await tool.run(ctx.user_input, ctx))
+        assert msg["type"] == "economics"
+        assert msg["content"] == "The INR has been around 0.012 USD."
+        assert msg["source"] == "https://api.frankfurter.dev/v2/rates"
 
         # The business context and transcript reached the plan prompt.
         assert captured["plan"]["context"]["business_about"] == "importing goods"
@@ -1669,9 +1685,9 @@ def test_foresight_tool_routes_and_streams(monkeypatch):
         assert raw["probability_total"] == 1.0
         return "Two scenarios ahead: steady growth (60%) or a downturn (40%)."
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(ForesightTool, "_plan", fake_plan)
-    monkeypatch.setattr(ForesightTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(ForesightAgent, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightAgent, "_summarize", fake_summarize)
 
     async def scenario():
         session = await _make_session()
@@ -1689,15 +1705,15 @@ def test_foresight_tool_routes_and_streams(monkeypatch):
             sid, "ASSISTANT", "TOOL",
             {"type": "questionnaire_complete", "content": "done", "context": {"business_about": TEST_IDEA, "q1": "people"}},
         )
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": "scenarios for the next 2 years"}, graph
+                {"session_id": sid, "user_input": "scenarios for the next 2 years"}, engine
             )
             events = await _collect(ps, 3)
 
-            assert result["messages"][-2]["type"] == "foresight_request"
+            assert result["messages"][-2]["type"] == "chat"  # composer's USER echo
             assert result["messages"][-1]["type"] == "foresight"
             assert len(result["messages"][-1]["data"]["scenarios"]) == 2
             assert result["messages"][-1]["data"]["probabilities_sum_to_one"] is True
@@ -1710,7 +1726,7 @@ def test_foresight_tool_routes_and_streams(monkeypatch):
             assert events[2]["type"] == "end"
 
             msgs = await db.message.find_many(where={"sessionId": sid})
-            assert [m.agent for m in msgs].count("TOOL") == 6
+            assert [m.agent for m in msgs].count("TOOL") == 5
 
             await ps.unsubscribe(f"stream:{sid}")
             await ps.close()
@@ -1738,20 +1754,20 @@ def test_foresight_gated_until_questionnaire_complete(monkeypatch):
     async def fake_foresight_run(self, state):
         raise AssertionError("foresight must not run before the questionnaire is completed")
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(QuestionnaireTool, "_is_real_idea", fake_is_real_idea)
-    monkeypatch.setattr(QuestionnaireTool, "_plan", fake_plan)
-    monkeypatch.setattr(ForesightTool, "run", fake_foresight_run)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(QuestionnaireAgent, "_is_real_idea", fake_is_real_idea)
+    monkeypatch.setattr(QuestionnaireAgent, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightAgent, "run", fake_foresight_run)
 
     async def scenario():
         session = await _make_session()
         sid = session.id
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         request = "What are the possible futures for my business?"
         try:
             result = await process_job(
-                {"session_id": sid, "user_input": request}, graph
+                {"session_id": sid, "user_input": request}, engine
             )
             await _collect(ps, 3)
 
@@ -1825,29 +1841,26 @@ def test_foresight_tool_includes_history_and_data(monkeypatch):
         captured["summarize"] = {"request": request, "raw": raw}
         return "Here are Mars' observable positions; this is not a prediction."
 
-    tool = ForesightTool()
-    monkeypatch.setattr(ForesightTool, "_plan", fake_plan)
-    monkeypatch.setattr(ForesightTool, "_summarize", fake_summarize)
+    tool = ForesightAgent()
+    monkeypatch.setattr(ForesightAgent, "_plan", fake_plan)
+    monkeypatch.setattr(ForesightAgent, "_summarize", fake_summarize)
     monkeypatch.setattr(
-        "worker.tools.foresight_tool.fetch_jpl_horizons_ephemeris", fake_fetch
+        "worker.agents.foresight_agent.fetch_jpl_horizons_ephemeris", fake_fetch
     )
 
     async def scenario():
-        entries = await tool.run(
-            {
-                "session_id": "s",
-                "user_input": "Where is Mars this week?",
-                "messages": [
-                    {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to open a bakery in Pune."},
-                    {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "a bakery in Pune"}},
-                ],
-            }
+        ctx = make_ctx(
+            request="Where is Mars this week?",
+            messages=[
+                {"role": "USER", "agent": "CHAT", "type": "chat", "content": "I plan to open a bakery in Pune."},
+                {"role": "ASSISTANT", "agent": "TOOL", "type": "questionnaire_complete", "content": "done", "context": {"business_about": "a bakery in Pune"}},
+            ],
         )
-        assert entries[0]["type"] == "foresight_request"
-        assert entries[1]["type"] == "foresight"
-        assert entries[1]["content"] == "Here are Mars' observable positions; this is not a prediction."
-        assert entries[1]["source"] == "https://ssd.jpl.nasa.gov/api/horizons.api"
-        assert "Astronomical data is scientific" in entries[1]["data"]["disclaimer"]
+        msg = assistant_card(await tool.run(ctx.user_input, ctx))
+        assert msg["type"] == "foresight"
+        assert msg["content"] == "Here are Mars' observable positions; this is not a prediction."
+        assert msg["source"] == "https://ssd.jpl.nasa.gov/api/horizons.api"
+        assert "Astronomical data is scientific" in msg["data"]["disclaimer"]
 
         assert captured["plan"]["context"]["business_about"] == "a bakery in Pune"
         assert "I plan to open a bakery in Pune." in captured["plan"]["transcript"]
@@ -1971,16 +1984,18 @@ def test_cached_json_retries_transient_statuses(monkeypatch):
 
 
 def test_prompts_route_general_questions_to_tools_not_business_only():
-    """The router prompt must send factual/data questions to the matching tool
-    (economics for World Bank/GDP data) instead of treating them as chat, and
-    the chat prompt must answer general questions instead of declining them."""
+    """The planner prompt must send factual/data questions to the matching
+    subagent (economics for World Bank/GDP data) instead of treating them as
+    chat, and the chat prompt must answer general questions instead of
+    declining them."""
     from worker.prompts.chat import CHAT_PROMPT
-    from worker.prompts.router import ROUTER_PROMPT
+    from worker.prompts.orchestrator import PLAN_PROMPT
 
-    assert "World Bank indicators or country profiles" in ROUTER_PROMPT
-    assert '-> "economics"' in ROUTER_PROMPT
-    assert '-> "foresight"' in ROUTER_PROMPT
-    assert "Keep the conversation on business topics" not in ROUTER_PROMPT
+    assert "World Bank" in PLAN_PROMPT
+    assert "inline" in PLAN_PROMPT
+    assert "dashboard" in PLAN_PROMPT
+    assert "questionnaire" in PLAN_PROMPT
+    assert "Keep the conversation on business topics" not in PLAN_PROMPT
     assert "ONLY talk about business" not in CHAT_PROMPT
     assert "general knowledge" in CHAT_PROMPT
 
@@ -2015,11 +2030,11 @@ def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
         assert raw["country"] == "India"
         return "India is a Lower middle income economy in South Asia with capital New Delhi."
 
-    monkeypatch.setattr(RouterAgent, "classify", fake_classify)
-    monkeypatch.setattr(EconomicsTool, "_plan", fake_plan)
-    monkeypatch.setattr(EconomicsTool, "_summarize", fake_summarize)
+    monkeypatch.setattr(Planner, "_llm_plan", llm_plan_from(fake_classify))
+    monkeypatch.setattr(EconomicsAgent, "_plan", fake_plan)
+    monkeypatch.setattr(EconomicsAgent, "_summarize", fake_summarize)
     monkeypatch.setattr(
-        "worker.tools.economics_tool.fetch_world_bank_country_profile", fake_fetch
+        "worker.agents.economics_agent.fetch_world_bank_country_profile", fake_fetch
     )
 
     async def scenario():
@@ -2030,7 +2045,7 @@ def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
             {"type": "questionnaire_complete", "content": "done",
              "context": {"business_about": TEST_IDEA}},
         )
-        graph = build_graph()
+        engine = Orchestrator()
         ps = await _subscribe(sid)
         try:
             result = await process_job(
@@ -2038,11 +2053,11 @@ def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
                     "session_id": sid,
                     "user_input": "can you give me world bank country profile for india",
                 },
-                graph,
+                engine,
             )
             await _collect(ps, 3)
 
-            assert result["messages"][-2]["type"] == "economics_request"
+            assert result["messages"][-2]["type"] == "chat"  # composer's USER echo
             assert result["messages"][-1]["type"] == "economics"
             assert result["messages"][-1]["content"] == (
                 "India is a Lower middle income economy in South Asia with capital New Delhi."
@@ -2063,7 +2078,7 @@ def test_world_bank_country_profile_answered_via_economics_tool(monkeypatch):
 def test_fetch_world_bank_indicator_parses_and_sorts(monkeypatch):
     """World Bank indicator responses are parsed into sorted observations and
     country codes are uppercased."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def fake_cached_json(method, url, **kwargs):
         assert "per_page" in kwargs["params"]
@@ -2105,7 +2120,7 @@ def test_fetch_world_bank_indicator_parses_and_sorts(monkeypatch):
 def test_fetch_world_bank_indicator_handles_empty_payload(monkeypatch):
     """Non-list or short payloads produce an empty observations list instead of
     an error."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def fake_cached_json(method, url, **kwargs):
         return {"not": "a list"}
@@ -2131,7 +2146,7 @@ def test_fetch_world_bank_indicator_rejects_invalid_range():
 
         # avoid coroutine: call the wrapper through a captured event loop
         async def _scenario():
-            from worker.tools import economics_tool
+            from worker.agents import economics_agent as economics_tool
 
             await economics_tool.fetch_world_bank_indicator(
                 "IN", "X", start_year=2024, end_year=2020
@@ -2142,7 +2157,7 @@ def test_fetch_world_bank_indicator_rejects_invalid_range():
 
 def test_fetch_world_bank_country_profile_empty(monkeypatch):
     """An empty country list yields a None country rather than an error."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def fake_cached_json(method, url, **kwargs):
         return [{"page": 1}, []]
@@ -2159,7 +2174,7 @@ def test_fetch_world_bank_country_profile_empty(monkeypatch):
 
 def test_fetch_bls_time_series_parses_values(monkeypatch):
     """BLS series parse float values and keep the raw value, sorting by date."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def fake_cached_json(method, url, **kwargs):
         assert kwargs["json_body"] == {"seriesid": ["CUUR0000SA0"]}
@@ -2201,7 +2216,7 @@ def test_fetch_bls_time_series_parses_values(monkeypatch):
 
 def test_fetch_bls_time_series_handles_failed_status(monkeypatch):
     """A non-REQUEST_SUCCEEDED response surfaces the API status and messages."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def fake_cached_json(method, url, **kwargs):
         return {"status": "REQUEST_FAILED", "message": ["No data"]}
@@ -2219,7 +2234,7 @@ def test_fetch_bls_time_series_handles_failed_status(monkeypatch):
 
 def test_fetch_bls_time_series_validates_series_count(monkeypatch):
     """BLS accepts between 1 and 20 series IDs."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def scenario():
         with pytest.raises(ValueError, match="between 1 and 20"):
@@ -2230,7 +2245,7 @@ def test_fetch_bls_time_series_validates_series_count(monkeypatch):
 
 def test_fetch_exchange_rate_series_validates_args(monkeypatch):
     """Quote currencies are required and the group must be week/month."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
     async def fake_cached_json(method, url, **kwargs):
         return {"base": "USD", "rates": []}
@@ -2255,7 +2270,7 @@ def test_fetch_exchange_rate_series_validates_args(monkeypatch):
 
 def test_economics_trim_limits_data():
     """_trim caps observation lists so persisted messages stay small."""
-    from worker.tools.economics_tool import MAX_OBSERVATIONS, _trim
+    from worker.agents.economics_agent import MAX_OBSERVATIONS, _trim
 
     rows = [{"year": i, "value": i} for i in range(50)]
     trimmed = _trim({"observations": rows, "series": [{"observations": rows}]})
@@ -2268,10 +2283,10 @@ def test_economics_trim_limits_data():
 
 def test_economics_dispatch_rejects_unknown_operation(monkeypatch):
     """An unrecognized operation bubbles up as a ValueError."""
-    from worker.tools import economics_tool
+    from worker.agents import economics_agent as economics_tool
 
-    tool = economics_tool.EconomicsTool()
-    monkeypatch.setattr(economics_tool.EconomicsTool, "_plan", None)
+    tool = economics_tool.EconomicsAgent()
+    monkeypatch.setattr(economics_tool.EconomicsAgent, "_plan", None)
 
     async def scenario():
         with pytest.raises(ValueError, match="Unknown economics operation"):
@@ -2282,9 +2297,9 @@ def test_economics_dispatch_rejects_unknown_operation(monkeypatch):
 
 def test_foresight_dispatch_validates_scenario_plan(monkeypatch):
     """Scenario planning requires at least one valid scenario dict."""
-    from worker.tools import foresight_tool
+    from worker.agents import foresight_agent as foresight_tool
 
-    tool = foresight_tool.ForesightTool()
+    tool = foresight_tool.ForesightAgent()
 
     async def scenario():
         with pytest.raises(ValueError, match="at least one scenario"):
@@ -2305,7 +2320,7 @@ def test_foresight_dispatch_validates_scenario_plan(monkeypatch):
 def test_fetch_jpl_ephemeris_truncates_output(monkeypatch):
     """JPL responses are truncated to the trailing 20k chars so messages stay
     small."""
-    from worker.tools import foresight_tool
+    from worker.agents import foresight_agent as foresight_tool
 
     async def fake_cached_json(method, url, **kwargs):
         return {"result": "x" * 50000}
@@ -2326,7 +2341,7 @@ def test_fetch_jpl_ephemeris_truncates_output(monkeypatch):
 def test_future_signpost_matrix_flags_non_sum_one():
     """Probabilities that don't sum to one are flagged, and empty scenario lists
     are rejected."""
-    from worker.tools.foresight_tool import future_signpost_matrix
+    from worker.agents.foresight_agent import future_signpost_matrix
 
     result = future_signpost_matrix([{"name": "A", "probability": 0.5}])
     assert result["probabilities_sum_to_one"] is False

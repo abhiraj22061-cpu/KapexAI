@@ -32,6 +32,13 @@ def format_transcript(messages: list[dict], limit: int = MESSAGE_LIMIT) -> str:
         role = msg.get("role", "?")
         msg_type = msg.get("type", "")
         content = msg.get("content", "")
+        if msg_type == "dashboard":
+            # Keep the transcript compact: the full document lives in
+            # dashboard_data (or its row) and would swamp the prompt.
+            name = msg.get("dashboard_name") or "Dashboard"
+            data = msg.get("dashboard_data") or {}
+            summary = str(data.get("summary") or data.get("title") or "").strip()
+            content = f"{name} — {summary}" if summary else name
         lines.append(f"{role} ({msg_type}): {content}")
     return "\n".join(lines)
 

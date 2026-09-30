@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.json_utils import extract_text
 from worker.prompts.chat import CHAT_TEMPLATE
@@ -13,7 +13,7 @@ from worker.prompts.chat import CHAT_TEMPLATE
 
 class ChatAgent:
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.5)
+        self.llm = get_llm(0.5)
 
     async def run(
         self,
@@ -21,6 +21,7 @@ class ChatAgent:
         transcript: str,
         context: dict,
         tools: list[dict],
+        notes: str = "",
     ) -> str:
         chain = CHAT_TEMPLATE | self.llm
         response = await chain.ainvoke(
@@ -29,6 +30,7 @@ class ChatAgent:
                 "transcript": transcript,
                 "context": json.dumps(context, indent=2),
                 "tools": json.dumps([t["name"] for t in tools], indent=2),
+                "notes": notes or "(none)",
             }
         )
         return extract_text(response.content)

@@ -15,12 +15,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.json_utils import parse_json
-from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.indian_finance import INDIAN_FINANCE_TEMPLATE
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 
 def _positive(value: float, name: str) -> None:
@@ -583,7 +582,7 @@ def _format_result(data: dict, result: dict) -> str:
     return "\n".join(lines).strip()
 
 
-class IndianFinanceTool(Tool):
+class IndianFinanceAgent(SubAgent):
     name = "indian_finance"
     description = "Calculate Indian financial metrics: EMI, SIP, PPF, EPF, NPS, HRA, ELSS, loan calculations and other India-specific finance tools."
     example = "Calculate my SIP returns"
@@ -591,12 +590,12 @@ class IndianFinanceTool(Tool):
     requires_context = False
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
+        self.llm = get_llm(0)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "")
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        request = query
+        context = ctx.business_context
+        transcript = ctx.transcript
 
         chain = INDIAN_FINANCE_TEMPLATE | self.llm
         response = await chain.ainvoke(
@@ -620,19 +619,8 @@ class IndianFinanceTool(Tool):
         if not isinstance(result, dict):
             raise TypeError(f"Unexpected calculator result for {calc_type}: {result}")
 
-        return [
-            {
-                "role": "USER",
-                "agent": "TOOL",
-                "type": "finance_request",
-                "content": request,
-            },
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "indian_finance",
-                "content": _format_result(data, result),
-                "calculation_type": calc_type,
-                "result": result,
-            },
-        ]
+        return AgentResult(
+            text=_format_result(data, result),
+            data={"calculation_type": calc_type, "result": result},
+            message_type="indian_finance",
+        )

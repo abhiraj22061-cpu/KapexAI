@@ -42,7 +42,8 @@ model Session {
 
   created_at DateTime @default(now())
 
-  messages Message[]
+  messages   Message[]
+  dashboards Dashboard[]
 }
 
 model Message {
@@ -56,6 +57,21 @@ model Message {
   agent Agent @default(QUESTIONNAIRE)
 
   content Json
+
+  created_at DateTime @default(now())
+
+  @@index([sessionId, created_at])
+}
+
+model Dashboard {
+  id String @id @default(uuid())
+
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId String
+
+  name String
+
+  data Json
 
   created_at DateTime @default(now())
 

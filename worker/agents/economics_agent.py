@@ -1,4 +1,5 @@
 import json
+import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -7,16 +8,15 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.http_cache import cached_json
 from worker.helpers.json_utils import extract_text, parse_json
-from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.economics import (
     ECONOMICS_PLAN_TEMPLATE,
     ECONOMICS_SUMMARY_TEMPLATE,
 )
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 MAX_OBSERVATIONS = 12  # how many data points are kept in the message/card
 
@@ -188,7 +188,7 @@ async def fetch_exchange_rate_series(
     }
 
 
-class EconomicsTool(Tool):
+class EconomicsAgent(SubAgent):
     name = "economics"
     description = (
         "Fetch live economic and market data: GDP, inflation, population or other World Bank "
@@ -199,12 +199,12 @@ class EconomicsTool(Tool):
     requires_context = True
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
+        self.llm = get_llm(0.1)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "").strip()
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        request = query.strip()
+        context = ctx.business_context
+        transcript = ctx.transcript
 
         plan = await self._plan(request, context, transcript)
         operation = str(plan.get("operation") or "")
@@ -215,22 +215,12 @@ class EconomicsTool(Tool):
         raw = await self._dispatch(operation, args)
         summary = await self._summarize(request, context, transcript, raw)
 
-        return [
-            {
-                "role": "USER",
-                "agent": "TOOL",
-                "type": "economics_request",
-                "content": request,
-            },
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "economics",
-                "content": summary,
-                "data": _trim(raw),
-                "source": raw.get("source", ""),
-            },
-        ]
+        return AgentResult(
+            text=summary,
+            data={"data": _trim(raw), "source": raw.get("source", "")},
+            message_type="economics",
+            sources=_sources_for(raw),
+        )
 
     async def _plan(self, request: str, context: dict, transcript: str) -> dict:
         """Asks the LLM which of the four data operations to run and with what args."""
@@ -289,6 +279,22 @@ class EconomicsTool(Tool):
                 _opt_str(args.get("group")),
             )
         raise ValueError(f"Unknown economics operation: {operation!r}")
+
+
+_SOURCE_LABELS = {
+    "api.worldbank.org": "World Bank",
+    "api.bls.gov": "U.S. Bureau of Labor Statistics",
+    "api.frankfurter.dev": "Frankfurter (ECB rates)",
+}
+
+
+def _sources_for(raw: dict) -> list[dict]:
+    """Grounded source for the fetched dataset (used for dashboard attribution)."""
+    url = str(raw.get("source") or "").strip()
+    if not url:
+        return []
+    host = urllib.parse.urlparse(url).netloc
+    return [{"label": _SOURCE_LABELS.get(host, host or url), "url": url}]
 
 
 def _opt_int(value: Any, default: int | None) -> int | None:

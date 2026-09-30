@@ -43,6 +43,13 @@ from .middleware.auth import get_current_user
 PENDING_KEY = "pending:{session_id}"
 PENDING_TTL = 5 * 60  # seconds
 
+# Per-turn buffer of streamed frames (Redis list, written by the worker).
+# The WebSocket endpoint tails it instead of relying on pub/sub alone, so a
+# client that connects after a fast turn finished still gets the frames.
+# NOTE: mirrored in worker/helpers/events.py (backend must not import worker).
+STREAM_FRAMES_KEY = "stream:{session_id}:frames"
+FRAMES_TTL = 5 * 60  # seconds
+
 
 async def mark_pending(session_id: str, content: str, msg_type: str) -> None:
     """Records the user's latest in-flight message and flags the session as
@@ -52,6 +59,9 @@ async def mark_pending(session_id: str, content: str, msg_type: str) -> None:
         json.dumps({"content": content, "type": msg_type}),
         ex=PENDING_TTL,
     )
+    # A new turn owns a fresh frame buffer — drop the previous turn's frames
+    # so a late subscriber can never replay the wrong reply.
+    await redis.delete(STREAM_FRAMES_KEY.format(session_id=session_id))
     await db.session.update(where={"id": session_id}, data={"status": "PENDING"})
 
 
@@ -104,9 +114,12 @@ async def create_chat_session(user_data: CreateChatSession, current_user = Depen
         }
     )
 
+    # Pending is marked before the job is queued so the worker can never
+    # finish (and clear it) before it was set — that ordering bug left
+    # sessions stuck "PENDING" with a typing indicator that never went away.
+    await mark_pending(session.id, user_data.content, "chat")
     job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": user_data.content}
     await redis.lpush("jobs:queue", json.dumps(job))
-    await mark_pending(session.id, user_data.content, "chat")
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -124,9 +137,9 @@ async def push_chat_message(user_data: UserChatMessage, current_user = Depends(g
             content={"message": "session not found for user"},
         )
 
+    await mark_pending(session.id, user_data.content, "chat")
     job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": user_data.content}
     await redis.lpush("jobs:queue", json.dumps(job))
-    await mark_pending(session.id, user_data.content, "chat")
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -152,13 +165,12 @@ async def submit_questionnaire_answers(user_data: SubmitQuestionnaireAnswersRequ
             "answers": [{"key": a.key, "answer": a.answer} for a in user_data.answers],
         }
     )
-    job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": payload}
-    await redis.lpush("jobs:queue", json.dumps(job))
-
     content = "\n".join(
         f"{i + 1}) {a.answer or 'Skipped'}" for i, a in enumerate(user_data.answers)
     )
     await mark_pending(session.id, content, "questionnaire_answer")
+    job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": payload}
+    await redis.lpush("jobs:queue", json.dumps(job))
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -180,9 +192,9 @@ async def submit_questionnaire_clarification(user_data: SubmitQuestionnaireClari
     payload = json.dumps(
         {"kind": "questionnaire_clarification", "keys": user_data.keys}
     )
+    await mark_pending(session.id, "Asked for a simpler explanation", "chat")
     job = {"job_id": str(uuid4()), "session_id": session.id, "user_input": payload}
     await redis.lpush("jobs:queue", json.dumps(job))
-    await mark_pending(session.id, "Asked for a simpler explanation", "chat")
 
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
@@ -192,12 +204,28 @@ async def submit_questionnaire_clarification(user_data: SubmitQuestionnaireClari
 @app.get("/get_sessions")
 async def get_sessions(current_user = Depends(get_current_user)):
     sessions = await get_all_sessions(current_user)
+
+    # Dashboards are grouped into their sessions in one query so the sidebar
+    # can render the per-session dashboard lists without N+1 calls.
+    session_ids = [s.id for s in sessions]
+    dashboards_by_session: dict[str, list[dict]] = {sid: [] for sid in session_ids}
+    if session_ids:
+        rows = await db.dashboard.find_many(
+            where={"sessionId": {"in": session_ids}},
+            order={"created_at": "asc"},
+        )
+        for d in rows:
+            dashboards_by_session.setdefault(d.sessionId, []).append(
+                {"id": d.id, "name": d.name, "created_at": d.created_at.isoformat()}
+            )
+
     data = [
         {
             "id": s.id,
             "business_idea": s.business_idea,
             "status": str(s.status),
             "created_at": s.created_at.isoformat(),
+            "dashboards": dashboards_by_session.get(s.id, []),
         }
         for s in sessions
     ]
@@ -243,6 +271,61 @@ async def get_messages(session_id: str, current_user = Depends(get_current_user)
     )
 
 
+@app.get("/get_dashboards")
+async def get_dashboards(session_id: str, current_user = Depends(get_current_user)):
+    """Lists every dashboard generated in a session (id + name + timestamp),
+    oldest first — drives the dashboard tab bar and the sidebar section."""
+    session = await get_session(session_id)
+    if not session or session.userId != current_user.id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "session not found for user"},
+        )
+
+    rows = await db.dashboard.find_many(
+        where={"sessionId": session_id},
+        order={"created_at": "asc"},
+    )
+    data = [
+        {"id": d.id, "name": d.name, "created_at": d.created_at.isoformat()}
+        for d in rows
+    ]
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"data": data})
+
+
+@app.get("/get_dashboard")
+async def get_dashboard(dashboard_id: str, current_user = Depends(get_current_user)):
+    """Returns one dashboard with its full JSON payload (read-only; dashboards
+    are created by the worker and never edited by the user)."""
+    dashboard = await db.dashboard.find_unique(where={"id": dashboard_id})
+    if not dashboard:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "dashboard not found"},
+        )
+
+    session = await get_session(dashboard.sessionId)
+    if not session or session.userId != current_user.id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"message": "dashboard not found for user"},
+        )
+
+    data = dashboard.data if isinstance(dashboard.data, dict) else {}
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "data": {
+                "id": dashboard.id,
+                "name": dashboard.name,
+                "session_id": dashboard.sessionId,
+                "created_at": dashboard.created_at.isoformat(),
+                "data": data,
+            }
+        },
+    )
+
+
 @app.post("/rename_session")
 async def rename_session(user_data: RenameSessionRequest, current_user = Depends(get_current_user)):
     """Renames a chat session (its `business_idea` title) for the current user."""
@@ -277,7 +360,7 @@ async def rename_session(user_data: RenameSessionRequest, current_user = Depends
 
 @app.post("/delete_session")
 async def delete_session(user_data: DeleteSessionRequest, current_user = Depends(get_current_user)):
-    """Deletes a chat session along with all of its messages."""
+    """Deletes a chat session along with all of its messages and dashboards."""
     session = await get_session(user_data.session_id)
     if not session or session.userId != current_user.id:
         return JSONResponse(
@@ -288,8 +371,10 @@ async def delete_session(user_data: DeleteSessionRequest, current_user = Depends
     # Drop any cached graph state so it can't be resurrected by the worker.
     await redis.delete(f"langgraph_state:{session.id}")
     await redis.delete(PENDING_KEY.format(session_id=session.id))
+    await redis.delete(STREAM_FRAMES_KEY.format(session_id=session.id))
 
     await db.message.delete_many(where={"sessionId": session.id})
+    await db.dashboard.delete_many(where={"sessionId": session.id})
     await db.session.delete(where={"id": session.id})
 
     return JSONResponse(
@@ -327,47 +412,50 @@ async def update_business_profile(profile_data: BusinessProfileRequest, current_
 
 @app.websocket("/ws/session/{session_id}")
 async def websocket_stream(websocket: WebSocket, session_id: str):
+    """Tails a session's frame buffer to the client.
+
+    The Redis list is the source of truth (the worker appends to it and the
+    pub/sub publish is just a wakeup), so a client that connects *after* a
+    fast turn already finished — or between two frames during a reconnect —
+    still replays everything it missed instead of losing the reply."""
     await websocket.accept()
 
-    # If no job is in flight for this session, nothing will be published to the
-    # channel — close right away instead of holding an idle connection open.
-    if not await redis.get(PENDING_KEY.format(session_id=session_id)):
-        await _safe_send(websocket, {"type": "end"})
+    frames_key = STREAM_FRAMES_KEY.format(session_id=session_id)
+    pending_key = PENDING_KEY.format(session_id=session_id)
+    channel = f"stream:{session_id}"
+
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(channel)
+    cursor = 0
+    try:
+        while True:
+            raw_frames = await redis.lrange(frames_key, cursor, -1)
+            if raw_frames:
+                cursor += len(raw_frames)
+                for raw in raw_frames:
+                    data = json.loads(raw)
+                    if not await _safe_send(websocket, data):
+                        return  # client disconnected mid-stream
+                    if data.get("type") == "end":
+                        return  # turn fully delivered
+                continue
+
+            if not await redis.get(pending_key):
+                # Buffer drained and no job in flight: the turn is over
+                # (or nothing ever streamed — same signal as before).
+                await _safe_send(websocket, {"type": "end"})
+                return
+
+            # Job still running — wait for the worker's wakeup publish
+            # (the 1s timeout also acts as a poll for missed wakeups).
+            await pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+    finally:
+        await pubsub.unsubscribe(channel)
+        await pubsub.close()
         try:
             await websocket.close()
         except RuntimeError:
             pass
-        return
-
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(f"stream:{session_id}")
-
-    try:
-        while True:
-            message = await pubsub.get_message(
-                ignore_subscribe_messages=True, timeout=10
-            )
-            if message is None:
-                # Idle: if the worker has finished (pending cleared) there is
-                # nothing left to stream, so signal the end and close.
-                if not await redis.get(PENDING_KEY.format(session_id=session_id)):
-                    await _safe_send(websocket, {"type": "end"})
-                    break
-                continue
-            data = json.loads(message["data"])
-            if not await _safe_send(websocket, data):
-                # The client disconnected mid-stream — stop forwarding.
-                break
-            if data.get("type") == "end":
-                break
-    finally:
-        await pubsub.unsubscribe(f"stream:{session_id}")
-        await pubsub.close()
-
-    try:
-        await websocket.close()
-    except RuntimeError:
-        pass
 
 
 async def _safe_send(websocket: WebSocket, data: dict) -> bool:

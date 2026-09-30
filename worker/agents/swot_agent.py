@@ -5,12 +5,11 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 
 from worker.helpers.json_utils import parse_json
-from worker.helpers.messages import business_context, format_transcript
 from worker.prompts.swot import SWOT_TEMPLATE
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 
 _SECTION_LABELS = {
     "strengths": "Strengths",
@@ -20,7 +19,7 @@ _SECTION_LABELS = {
 }
 
 
-class SwotTool(Tool):
+class SwotAgent(SubAgent):
     name = "swot"
     description = "Creates a SWOT (Strengths, Weaknesses, Opportunities, Threats) analysis for a business."
     example = "Run a SWOT analysis for my business"
@@ -28,41 +27,29 @@ class SwotTool(Tool):
     requires_context = True
 
     def __init__(self) -> None:
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.4)
+        self.llm = get_llm(0.4)
 
-    async def run(self, state: dict) -> list[dict]:
-        request = str(state.get("user_input") or "")
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
-
+    async def run(self, query: str, ctx: AgentContext) -> AgentResult:
         chain = SWOT_TEMPLATE | self.llm
         response = await chain.ainvoke(
             {
-                "request": request,
-                "context": json.dumps(context, indent=2),
-                "transcript": transcript,
+                "request": query,
+                "context": json.dumps(ctx.business_context, indent=2),
+                "transcript": ctx.transcript,
             }
         )
         data = parse_json(response.content)
         if not isinstance(data, dict) or "sections" not in data:
             raise ValueError(f"Unexpected SWOT output: {response.content}")
 
-        return [
-            {
-                "role": "USER",
-                "agent": "TOOL",
-                "type": "swot_request",
-                "content": request,
-            },
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "swot",
-                "content": _format_swot(data),
+        return AgentResult(
+            text=_format_swot(data),
+            data={
                 "sections": data.get("sections", {}),
                 "summary": data.get("summary", ""),
             },
-        ]
+            message_type="swot",
+        )
 
 
 def _format_swot(data: dict) -> str:

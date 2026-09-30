@@ -2,6 +2,8 @@ import type {
   AuthenticatedUser,
   BusinessProfile,
   ChatMessage,
+  DashboardDetail,
+  DashboardInfo,
   PendingMessage,
   QuestionnaireAnswer,
   SessionInfo,
@@ -173,6 +175,28 @@ export function deleteSession(
     body: { session_id: sessionId },
     token,
   })
+}
+
+// ── Dashboards ────────────────────────────────────────────────
+
+export function getDashboards(
+  token: string,
+  sessionId: string,
+): Promise<{ data: DashboardInfo[] }> {
+  return request<{ data: DashboardInfo[] }>(
+    `/get_dashboards?session_id=${encodeURIComponent(sessionId)}`,
+    { token },
+  )
+}
+
+export function getDashboard(
+  token: string,
+  dashboardId: string,
+): Promise<{ data: DashboardDetail }> {
+  return request<{ data: DashboardDetail }>(
+    `/get_dashboard?dashboard_id=${encodeURIComponent(dashboardId)}`,
+    { token },
+  )
 }
 
 // ── Business Profile ─────────────────────────────────────────

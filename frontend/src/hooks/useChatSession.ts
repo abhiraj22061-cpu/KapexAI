@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   createSession,
   deleteSession as apiDeleteSession,
@@ -42,6 +43,7 @@ type ChatSessionState = {
 
 export function useChatSession(): ChatSessionState {
   const { token } = useAuth()
+  const navigate = useNavigate()
 
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
@@ -54,6 +56,7 @@ export function useChatSession(): ChatSessionState {
   const [error, setError] = useState<string | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
+  const wsSessionRef = useRef<string | null>(null)
   const sendingRef = useRef(false)
 
   // The questionnaire deck is still awaiting answers when the latest
@@ -94,12 +97,40 @@ export function useChatSession(): ChatSessionState {
 
   const closeStream = useCallback((ws: WebSocket | null) => {
     if (ws) ws.close()
-    if (wsRef.current === ws) wsRef.current = null
+    if (wsRef.current === ws) {
+      wsRef.current = null
+      wsSessionRef.current = null
+    }
   }, [])
+
+  // Pulls the canonical message list after a turn that streamed nothing to
+  // this socket (the server replays buffered frames, but if the replay window
+  // was also missed the reply only lives in the API). This is what clears a
+  // stuck optimistic in-flight bubble when frames were lost around a reconnect.
+  const resyncMessages = useCallback(
+    async (sessionId: string) => {
+      if (!token || sessionId !== activeSessionId) return
+      try {
+        const { data } = await getMessages(token, sessionId)
+        if (sessionId === activeSessionId) setMessages(data)
+      } catch {
+        // Keep what we have — a later load will reconcile.
+      }
+    },
+    [token, activeSessionId],
+  )
 
   const streamSession = useCallback(
     (sessionId: string) => {
-      // Drop any previous socket so overlapping streams can't double-append.
+      // Reuse existing WebSocket if already connected to the same session.
+      if (wsRef.current && wsSessionRef.current === sessionId && wsRef.current.readyState === WebSocket.OPEN) {
+        setStreaming(true)
+        setSuggestions([])
+        setError(null)
+        return
+      }
+
+      // Different session or no active connection — establish a new one.
       closeStream(wsRef.current)
       setStreaming(true)
       setSuggestions([])
@@ -107,6 +138,8 @@ export function useChatSession(): ChatSessionState {
 
       const ws = new WebSocket(wsUrl(sessionId))
       wsRef.current = ws
+      wsSessionRef.current = sessionId
+      let sawContent = false
 
       ws.onmessage = (event: MessageEvent<string>) => {
         let frame: StreamFrame
@@ -117,8 +150,10 @@ export function useChatSession(): ChatSessionState {
         }
 
         if (frame.type === 'end') {
+          const missedContent = !sawContent
           closeStream(ws)
           setStreaming(false)
+          if (missedContent) void resyncMessages(sessionId)
           return
         }
         if (frame.type === 'suggestions') {
@@ -132,7 +167,14 @@ export function useChatSession(): ChatSessionState {
           return
         }
 
+        sawContent = true
         setMessages((prev) => [...prev, { role: 'ASSISTANT', ...frame } as ChatMessage])
+
+        if (frame.type === 'dashboard') {
+          // A dashboard was just generated — jump straight to it. The card in
+          // the chat history remains as the way back in later.
+          navigate(`/chat/${sessionId}/dashboard/${frame.dashboard_id}`)
+        }
       }
 
       ws.onerror = () => {
@@ -146,7 +188,7 @@ export function useChatSession(): ChatSessionState {
         setStreaming(false)
       }
     },
-    [closeStream],
+    [closeStream, resyncMessages],
   )
 
   const loadMessages = useCallback(

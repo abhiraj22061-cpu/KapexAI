@@ -9,11 +9,10 @@ logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from worker.llm import get_llm
 from langgraph.prebuilt import create_react_agent
 
-from worker.helpers.messages import business_context, format_transcript
-from worker.tools.base import Tool
+from worker.agents.base import AgentContext, AgentResult, SubAgent
 from worker.tools.equity_calculators import EQUITY_CALCULATOR_TOOLS
 from worker.tools.finance_calculators import FINANCE_CALCULATOR_TOOLS
 from worker.tools.finance_tools import FINANCE_TOOLS
@@ -50,7 +49,7 @@ Conversation so far:
 {transcript}"""
 
 
-class FinanceTool(Tool):
+class FinanceAgent(SubAgent):
     name = "finance"
     description = (
         "Performs financial calculations and analysis: investment returns, "
@@ -66,7 +65,7 @@ class FinanceTool(Tool):
         # once here and reused across every run() call. The system prompt is
         # built per request (with the business context and message history), so
         # the agent is created without a static prompt.
-        self.llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
+        self.llm = get_llm(0.1)
         self.agent = create_react_agent(
             self.llm,
             [
@@ -76,14 +75,11 @@ class FinanceTool(Tool):
             ],
         )
 
-    def run(self, state: dict) -> list[dict]:
-        prompt = str(state.get("user_input") or "").strip()
-        context = business_context(state["messages"])
-        transcript = format_transcript(state["messages"])
-
+    def run(self, query: str, ctx: AgentContext) -> AgentResult:
+        prompt = query.strip()
         system = FINANCE_SYSTEM_PROMPT.format(
-            context=json.dumps(context, indent=2),
-            transcript=transcript,
+            context=json.dumps(ctx.business_context, indent=2),
+            transcript=ctx.transcript,
         )
 
         try:
@@ -96,25 +92,14 @@ class FinanceTool(Tool):
                 }
             )
             content = result["messages"][-1].content
+            if not isinstance(content, str):
+                content = str(content)
         except Exception as exc:  # defensive: never let an internal error escape raw
-            logger.exception("Finance tool agent error")
+            logger.exception("Finance agent error")
             content = (
                 "I couldn't complete that finance calculation — the finance service "
                 f"hit an error ({exc.__class__.__name__}). Please try again, or rephrase "
                 "your request with the numbers you have."
             )
 
-        return [
-            {
-                "role": "USER",
-                "agent": "TOOL",
-                "type": "finance_request",
-                "content": prompt,
-            },
-            {
-                "role": "ASSISTANT",
-                "agent": "TOOL",
-                "type": "finance",
-                "content": content,
-            },
-        ]
+        return AgentResult(text=content, message_type="finance")
